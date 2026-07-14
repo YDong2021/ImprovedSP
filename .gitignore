@@ -1,0 +1,31 @@
+# ===== 大文件 / 数据 / 权重：不纳入 Git 版本控制 =====
+# 模型权重（每个约 120MB，共 18G）
+checkpoint/
+*.pth
+*.pt
+
+# 数据集图片（几万张，476M；属公开数据，不入库）
+dataset/
+
+# TensorBoard 训练日志
+tensorboard/
+
+# 压缩包
+*.tar
+*.tar.gz
+*.zip
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.ipynb_checkpoints/
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+
+# ===== 系统文件 =====
+.DS_Store
+Thumbs.db
