@@ -5,6 +5,8 @@ import random
 import torch
 import torch.utils.data
 import torch.nn.functional as F
+import torchvision
+torchvision.disable_beta_transforms_warning()
 from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
 
