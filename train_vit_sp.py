@@ -115,6 +115,9 @@ def main(args):
     feature_dim = 384
     if 2 <= args.stage < 3:
         feature_dim = 192
+    if args.prompt_layer == 'dynamic':
+        # dynamic mode always searches the 4 blocks of stage3 (dim=384)
+        feature_dim = 384
     if args.projector == 'linear':
         student.t2i = torch.nn.Linear(text_dim, feature_dim, bias=False)
     elif args.projector == 'mlp':
@@ -231,7 +234,9 @@ def train(text, student, train_loader, optim, epoch, args):
         glabels = glabels.view(args.train_way, args.shot+15)[:, :args.shot]
         glabels = glabels.contiguous().view(-1)
         text_features = text[glabels]
-        if args.prompt_mode == 'spatial':
+        if args.prompt_layer == 'dynamic':
+            _, sup_im_features = student.forward_with_semantic_prompt_dynamic(sup, text_features, args)
+        elif args.prompt_mode == 'spatial':
             text_features = student.t2i(text_features)
             _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
         else:
@@ -276,7 +281,9 @@ def test(text, student, test_loader, epoch, args):
                 glabels = glabels.view(args.way, args.shot + 15)[:, :args.shot]
                 glabels = glabels.contiguous().view(-1)
                 text_features = text[glabels]
-                if args.prompt_mode == 'spatial':
+                if args.prompt_layer == 'dynamic':
+                    _, sup_im_features = student.forward_with_semantic_prompt_dynamic(sup, text_features, args)
+                elif args.prompt_mode == 'spatial':
                     text_features = student.t2i(text_features)
                     _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
                 else:
@@ -318,7 +325,9 @@ def test(text, student, test_loader, epoch, args):
                 text_features = text[glabels]
                 # text_features = student.t2i(text_features)
                 # _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
-                if args.prompt_mode == 'spatial':
+                if args.prompt_layer == 'dynamic':
+                    _, sup_im_features = student.forward_with_semantic_prompt_dynamic(sup, text_features, args)
+                elif args.prompt_mode == 'spatial':
                     text_features = student.t2i(text_features)
                     _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
                 else:
@@ -374,6 +383,8 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='visformer-t', choices=['visformer-t', 'visformer-t-84'])
     parser.add_argument('--nlp_model', type=str, default='clip', choices=['clip', 'glove', 'mpnet'])
     parser.add_argument('--prompt_mode', type=str, default='spatial+channel', choices=['spatial', 'channel', 'spatial+channel'])
+    parser.add_argument('--prompt_layer', type=str, default='fixed', choices=['fixed', 'dynamic'],
+                        help='fixed: inject at args.stage; dynamic: per-sample select the best stage3 layer')
     parser.add_argument('--no_template', action='store_true')
     parser.add_argument('--eqnorm', action='store_true', default=True)
     parser.add_argument('--stage', type=float, default=3.2, choices=[2, 2.1, 2.2, 2.3, 3, 3.1, 3.2, 3.3])
