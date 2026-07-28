@@ -140,6 +140,25 @@ def main(args):
         student.mat = torch.nn.Parameter(torch.empty(args.num_mat, feature_dim))
         torch.nn.init.xavier_uniform_(student.mat)
 
+    if args.freeze_backbone:
+        # freeze the backbone except stem, the last two transformer blocks of stage3 and head;
+        # projector (t2i/t2i2/se_block) and MAT stay trainable
+        trainable_ids = set(id(p) for blk in student.stage3[-2:] for p in blk.parameters())
+        if student.using_stem:
+            trainable_ids.update(id(p) for p in student.stem.parameters())
+        trainable_ids.update(id(p) for p in student.head.parameters())
+        trainable_ids.update(id(p) for p in student.t2i.parameters())
+        if 'channel' in args.prompt_mode:
+            trainable_ids.update(id(p) for p in student.t2i2.parameters())
+            trainable_ids.update(id(p) for p in student.se_block.parameters())
+        if args.use_mat:
+            trainable_ids.add(id(student.mat))
+        for p in student.parameters():
+            p.requires_grad = id(p) in trainable_ids
+        n_train = sum(p.numel() for p in student.parameters() if p.requires_grad)
+        n_total = sum(p.numel() for p in student.parameters())
+        print(f'freeze backbone: trainable params {n_train / 1e6:.2f}M / {n_total / 1e6:.2f}M')
+
     student = student.cuda(args.gpu)
 
     optim_params_id = [id(param) for param in student.t2i.parameters()]
@@ -148,10 +167,10 @@ def main(args):
         # optim_params_id += [id(param) for param in student.se_block.parameters()]
     if args.use_mat:
         optim_params_id += [id(student.mat)]  # MAT is a prompt-like param, use the fast lr
-    optim_params = [param for param in student.parameters() if id(param) in optim_params_id]
-    other_params = [param for param in student.parameters() if id(param) not in optim_params_id]
+    optim_params = [param for param in student.parameters() if id(param) in optim_params_id and param.requires_grad]
+    other_params = [param for param in student.parameters() if id(param) not in optim_params_id and param.requires_grad]
     if args.optim == 'sgd':
-        optim = torch.optim.SGD(student.parameters(), lr=args.lr, momentum=0.9)
+        optim = torch.optim.SGD([param for param in student.parameters() if param.requires_grad], lr=args.lr, momentum=0.9)
     elif args.optim == 'adamw':
         optim = torch.optim.AdamW([{'params': optim_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
                                    {'params': other_params, 'lr': args.encoder_lr}], weight_decay=5e-2)
@@ -224,6 +243,12 @@ def get_text_feature(teacher, dataset, args):
 
 def train(text, student, train_loader, optim, epoch, args):
     student.train()
+    if args.freeze_backbone:
+        # keep frozen BatchNorm layers in eval mode so their running stats do not drift
+        for m in student.modules():
+            if isinstance(m, torch.nn.modules.batchnorm._BatchNorm) and \
+                    not any(p.requires_grad for p in m.parameters()):
+                m.eval()
     losses = 0.
     accs = 0.
     for idx, episode in enumerate(train_loader):
@@ -385,6 +410,8 @@ if __name__ == '__main__':
                         help='insert learnable multi-modal alignment tokens after the semantic prompt (requires spatial injection at stage3)')
     parser.add_argument('--num_mat', type=int, default=5,
                         help='number of multi-modal alignment tokens (must satisfy 1 + num_mat <= feature-map width, i.e. <= 6 at stage3)')
+    parser.add_argument('--freeze_backbone', action='store_true', default=False,
+                        help='freeze the backbone except stem, the last two transformer blocks and head; projector and MAT stay trainable')
     parser.add_argument('--no_template', action='store_true')
     parser.add_argument('--eqnorm', action='store_true', default=True)
     parser.add_argument('--stage', type=float, default=3.2, choices=[2, 2.1, 2.2, 2.3, 3, 3.1, 3.2, 3.3])
