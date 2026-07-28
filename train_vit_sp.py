@@ -135,12 +135,19 @@ def main(args):
                                                torch.nn.Linear(feature_dim, feature_dim),
                                                torch.nn.Sigmoid(),)
 
+    if args.use_mat:
+        # learnable multi-modal alignment token, inserted after the semantic prompt (VPT-style init)
+        student.mat = torch.nn.Parameter(torch.empty(1, feature_dim))
+        torch.nn.init.xavier_uniform_(student.mat)
+
     student = student.cuda(args.gpu)
 
     optim_params_id = [id(param) for param in student.t2i.parameters()]
     if 'channel' in args.prompt_mode:
         optim_params_id += [id(param) for param in student.t2i2.parameters()]  # se_block is not included. use smaller lr for se_block
         # optim_params_id += [id(param) for param in student.se_block.parameters()]
+    if args.use_mat:
+        optim_params_id += [id(student.mat)]  # MAT is a prompt-like param, use the fast lr
     optim_params = [param for param in student.parameters() if id(param) in optim_params_id]
     other_params = [param for param in student.parameters() if id(param) not in optim_params_id]
     if args.optim == 'sgd':
@@ -374,6 +381,8 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='visformer-t', choices=['visformer-t', 'visformer-t-84'])
     parser.add_argument('--nlp_model', type=str, default='clip', choices=['clip', 'glove', 'mpnet'])
     parser.add_argument('--prompt_mode', type=str, default='spatial+channel', choices=['spatial', 'channel', 'spatial+channel'])
+    parser.add_argument('--use_mat', action='store_true', default=False,
+                        help='insert a learnable multi-modal alignment token after the semantic prompt (requires spatial injection at stage3)')
     parser.add_argument('--no_template', action='store_true')
     parser.add_argument('--eqnorm', action='store_true', default=True)
     parser.add_argument('--stage', type=float, default=3.2, choices=[2, 2.1, 2.2, 2.3, 3, 3.1, 3.2, 3.3])

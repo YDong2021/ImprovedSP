@@ -106,23 +106,29 @@ class Attention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Conv2d(self.head_dim * self.num_heads, dim, 1, stride=1, padding=0, bias=False)
         self.proj_drop = nn.Dropout(proj_drop)
+        # number of real appended tokens in the last (partial) row when H != W:
+        # 1 = semantic prompt only (default); 2 = semantic prompt + multi-modal alignment token (MAT)
+        self.num_prompt = 1
 
     def forward(self, x):
         B, C, H, W = x.shape
         x = self.qkv(x)
         qkv = rearrange(x, 'b (x y z) h w -> x b y (h w) z', x=3, y=self.num_heads, z=self.head_dim)
         # changed by wentao to add a semantic prompt
+        # num_prompt real tokens live in the last partial row (semantic prompt [+ MAT])
         if H != W:
-            qkv = qkv[:, :, :, :(H-1)*W+1]
+            n_real = (H - 1) * W + self.num_prompt
+            qkv = qkv[:, :, :, :n_real]
         q, k, v = qkv[0], qkv[1], qkv[2]
         attn = ( (q * self.scale) @ (k.transpose(-2,-1) * self.scale) )
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
         x = attn @ v
         if H != W:
-            semantic_token = x[:, :, (H-1)*W:(H-1)*W+1]
-            semantic_token = semantic_token.repeat(1, 1, W-1, 1)
-            x = torch.cat([x, semantic_token], dim=2)
+            n_real = (H - 1) * W + self.num_prompt
+            pad_token = x[:, :, n_real - 1:n_real]
+            pad_token = pad_token.repeat(1, 1, W - self.num_prompt, 1)
+            x = torch.cat([x, pad_token], dim=2)
 
         x = rearrange(x, 'b y (h w) z -> b (y z) h w', h=H, w=W)
         x = self.proj(x)
@@ -430,6 +436,16 @@ class Visformer(nn.Module):
         return logit, x.squeeze()
 
     def forward_with_semantic_prompt_channel(self, x, semantic_prompt, args):
+        use_mat = getattr(args, 'use_mat', False)
+        if use_mat:
+            assert 'spatial' in args.prompt_mode and args.stage >= 3, \
+                'MAT requires spatial injection at stage3 (args.stage >= 3)'
+        # tell stage3 attention how many real appended tokens exist in the last row
+        n_prompt = 2 if use_mat else 1
+        for blk in self.stage3:
+            if hasattr(blk, 'attn'):
+                blk.attn.num_prompt = n_prompt
+
         if 'spatial' in args.prompt_mode:
             prompt1 = self.t2i(semantic_prompt)
         if 'channel' in args.prompt_mode:
@@ -487,8 +503,14 @@ class Visformer(nn.Module):
                     context = context - context.mean(dim=-1, keepdim=True)
                     x = x + context.view(B, C, 1, 1)
                 if 'spatial' in args.prompt_mode:
-                    prompt1 = prompt1.view(B, C, 1, 1).repeat(1, 1, 1, W)
-                    x = torch.cat([x, prompt1], dim=2)
+                    p = prompt1.view(B, C, 1, 1)
+                    if use_mat:
+                        # slot0 = semantic prompt, slot1 = MAT, rest = filler (dropped later)
+                        mat = self.mat.view(1, C, 1, 1).expand(B, -1, -1, -1)
+                        row = torch.cat([p, mat, p.repeat(1, 1, 1, W - 2)], dim=3)
+                    else:
+                        row = p.repeat(1, 1, 1, W)
+                    x = torch.cat([x, row], dim=2)
             x = b(x)
             stage += 0.1
 
@@ -499,7 +521,12 @@ class Visformer(nn.Module):
                 x = self.global_pooling(x)
             else:
                 B, C, H, W = x.shape
-                if args.avg == 'all':
+                if use_mat:
+                    # prototype = mean of 49 patch tokens + MAT, excluding semantic prompt
+                    patches = x.view(B, C, -1)[:, :, :(H - 1) * W]
+                    mat_out = x.view(B, C, -1)[:, :, (H - 1) * W + 1:(H - 1) * W + 2]
+                    x = torch.cat([patches, mat_out], dim=2).mean(-1)
+                elif args.avg == 'all':
                     x = x.view(B, C, -1)[:, :, :(H - 1) * W + 1].mean(-1)
                 elif args.avg == 'patch':
                     x = x.view(B, C, -1)[:, :, :(H - 1) * W].mean(-1)
