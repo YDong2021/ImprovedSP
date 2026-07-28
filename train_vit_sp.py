@@ -136,8 +136,8 @@ def main(args):
                                                torch.nn.Sigmoid(),)
 
     if args.use_mat:
-        # learnable multi-modal alignment token, inserted after the semantic prompt (VPT-style init)
-        student.mat = torch.nn.Parameter(torch.empty(1, feature_dim))
+        # learnable multi-modal alignment tokens, inserted after the semantic prompt (VPT-style init)
+        student.mat = torch.nn.Parameter(torch.empty(args.num_mat, feature_dim))
         torch.nn.init.xavier_uniform_(student.mat)
 
     student = student.cuda(args.gpu)
@@ -382,7 +382,9 @@ if __name__ == '__main__':
     parser.add_argument('--nlp_model', type=str, default='clip', choices=['clip', 'glove', 'mpnet'])
     parser.add_argument('--prompt_mode', type=str, default='spatial+channel', choices=['spatial', 'channel', 'spatial+channel'])
     parser.add_argument('--use_mat', action='store_true', default=False,
-                        help='insert a learnable multi-modal alignment token after the semantic prompt (requires spatial injection at stage3)')
+                        help='insert learnable multi-modal alignment tokens after the semantic prompt (requires spatial injection at stage3)')
+    parser.add_argument('--num_mat', type=int, default=5,
+                        help='number of multi-modal alignment tokens (must satisfy 1 + num_mat <= feature-map width, i.e. <= 6 at stage3)')
     parser.add_argument('--no_template', action='store_true')
     parser.add_argument('--eqnorm', action='store_true', default=True)
     parser.add_argument('--stage', type=float, default=3.2, choices=[2, 2.1, 2.2, 2.3, 3, 3.1, 3.2, 3.3])

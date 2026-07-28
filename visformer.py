@@ -107,7 +107,7 @@ class Attention(nn.Module):
         self.proj = nn.Conv2d(self.head_dim * self.num_heads, dim, 1, stride=1, padding=0, bias=False)
         self.proj_drop = nn.Dropout(proj_drop)
         # number of real appended tokens in the last (partial) row when H != W:
-        # 1 = semantic prompt only (default); 2 = semantic prompt + multi-modal alignment token (MAT)
+        # 1 = semantic prompt only (default); 1 + n_mat = semantic prompt + MAT tokens
         self.num_prompt = 1
 
     def forward(self, x):
@@ -441,7 +441,8 @@ class Visformer(nn.Module):
             assert 'spatial' in args.prompt_mode and args.stage >= 3, \
                 'MAT requires spatial injection at stage3 (args.stage >= 3)'
         # tell stage3 attention how many real appended tokens exist in the last row
-        n_prompt = 2 if use_mat else 1
+        n_mat = self.mat.shape[0] if use_mat else 0
+        n_prompt = 1 + n_mat
         for blk in self.stage3:
             if hasattr(blk, 'attn'):
                 blk.attn.num_prompt = n_prompt
@@ -505,9 +506,10 @@ class Visformer(nn.Module):
                 if 'spatial' in args.prompt_mode:
                     p = prompt1.view(B, C, 1, 1)
                     if use_mat:
-                        # slot0 = semantic prompt, slot1 = MAT, rest = filler (dropped later)
-                        mat = self.mat.view(1, C, 1, 1).expand(B, -1, -1, -1)
-                        row = torch.cat([p, mat, p.repeat(1, 1, 1, W - 2)], dim=3)
+                        # slot0 = semantic prompt, slots 1..n_mat = MAT tokens, rest = filler (dropped later)
+                        assert 1 + n_mat <= W, 'semantic prompt + MAT tokens must fit in one row'
+                        mat = self.mat.transpose(0, 1).reshape(1, C, 1, n_mat).expand(B, -1, -1, -1)
+                        row = torch.cat([p, mat, p.repeat(1, 1, 1, W - 1 - n_mat)], dim=3)
                     else:
                         row = p.repeat(1, 1, 1, W)
                     x = torch.cat([x, row], dim=2)
@@ -521,10 +523,10 @@ class Visformer(nn.Module):
                 x = self.global_pooling(x)
             else:
                 B, C, H, W = x.shape
-                # MAT output is excluded from the prototype: 'all'/'patch' slices below
-                # already stop before the MAT slot ((H-1)*W + 1); only 'head' needs care
+                # MAT outputs are excluded from the prototype: 'all'/'patch' slices below
+                # already stop before the MAT slots ((H-1)*W + 1); only 'head' needs care
                 if use_mat and args.avg == 'head':
-                    # with MAT the fillers copy MAT, so take the semantic prompt slot explicitly
+                    # with MAT the fillers copy the last MAT token, so take the semantic prompt slot explicitly
                     x = x.view(B, C, -1)[:, :, (H - 1) * W]
                 elif args.avg == 'all':
                     x = x.view(B, C, -1)[:, :, :(H - 1) * W + 1].mean(-1)
