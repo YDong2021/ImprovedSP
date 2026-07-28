@@ -521,11 +521,11 @@ class Visformer(nn.Module):
                 x = self.global_pooling(x)
             else:
                 B, C, H, W = x.shape
-                if use_mat:
-                    # prototype = mean of 49 patch tokens + MAT, excluding semantic prompt
-                    patches = x.view(B, C, -1)[:, :, :(H - 1) * W]
-                    mat_out = x.view(B, C, -1)[:, :, (H - 1) * W + 1:(H - 1) * W + 2]
-                    x = torch.cat([patches, mat_out], dim=2).mean(-1)
+                # MAT output is excluded from the prototype: 'all'/'patch' slices below
+                # already stop before the MAT slot ((H-1)*W + 1); only 'head' needs care
+                if use_mat and args.avg == 'head':
+                    # with MAT the fillers copy MAT, so take the semantic prompt slot explicitly
+                    x = x.view(B, C, -1)[:, :, (H - 1) * W]
                 elif args.avg == 'all':
                     x = x.view(B, C, -1)[:, :, :(H - 1) * W + 1].mean(-1)
                 elif args.avg == 'patch':
