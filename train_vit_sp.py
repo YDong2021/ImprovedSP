@@ -216,12 +216,10 @@ def get_text_feature(teacher, dataset, args):
 
 
 def forward_query_with_mixed_prompt(student, que, cand_text, args):
-    # query labels are unknown: inject the averaged prompt of all candidate
-    # classes (mixed semantic prompt) on the spatial dimension only,
-    # no channel-wise modulation for query samples
-    que_prompt = visformer.mix_prompt(student.t2i(cand_text))
-    que_prompt = que_prompt.unsqueeze(0).repeat(que.shape[0], 1)
-    return student.forward_with_semantic_prompt(que, que_prompt, args)
+    # query labels are unknown: at the injection layer, weight the candidate
+    # prompt tokens by their similarity to the visual context (per sample),
+    # then inject the weighted mixed prompt on both spatial and channel dimensions
+    return student.forward_with_semantic_prompt_channel(que, cand_text, args, weighted=True)
 
 
 def train(text, student, train_loader, optim, epoch, args):
@@ -394,6 +392,7 @@ if __name__ == '__main__':
     parser.add_argument('--projector', type=str, default='linear', choices=['linear', 'mlp', 'mlp3'])
     parser.add_argument('--avg', type=str, default='all', choices=['all', 'patch', 'head'])
     parser.add_argument('--t', type=float, default=0.2)
+    parser.add_argument('--sim_t', type=float, default=0.2)  # softmax temperature for weighted mixed prompt
     parser.add_argument('--optim', type=str, default='adamw', choices=['sgd', 'adamw'])
     parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--weight_decay', type=float, default=5e-2)

@@ -439,18 +439,40 @@ class Visformer(nn.Module):
         logit = self.head( x.view(x.size(0), -1) )
         return logit, x.squeeze()
 
-    def forward_with_semantic_prompt_channel(self, x, semantic_prompt, args, mixed=False):
+    # added for weighted mixed semantic prompt on query samples:
+    # match the visual context at the injection layer with each candidate
+    # prompt token (cosine in the t2i space), then average the candidate
+    # tokens with softmax weights and re-normalize
+    def _weighted_prompt(self, x, cand_text, args):
+        B, C = x.shape[0], x.shape[1]
+        p1 = self.t2i(cand_text)  # [N, C]
+        ctx = x.view(B, C, -1).mean(-1)  # [B, C]
+        sim = F.normalize(ctx, dim=-1) @ F.normalize(p1, dim=-1).t()  # [B, N]
+        weights = (sim / args.sim_t).softmax(dim=-1)
+        prompt1 = weights @ p1  # [B, C]
+        prompt1 = F.normalize(prompt1, dim=-1) * p1.norm(dim=-1).mean()
+        prompt2 = None
+        if 'channel' in args.prompt_mode:
+            p2 = self.t2i2(cand_text)
+            prompt2 = weights @ p2
+            prompt2 = F.normalize(prompt2, dim=-1) * p2.norm(dim=-1).mean()
+        return prompt1, prompt2
+
+    def forward_with_semantic_prompt_channel(self, x, semantic_prompt, args, mixed=False, weighted=False):
         # mixed=True: semantic_prompt is [N, text_dim] features of the N candidate
         # classes (query samples, label unknown). project each class, then average
         # into a single mixed prompt shared by the whole batch.
-        if 'spatial' in args.prompt_mode:
-            prompt1 = self.t2i(semantic_prompt)
-            if mixed:
-                prompt1 = mix_prompt(prompt1).unsqueeze(0).repeat(x.shape[0], 1)
-        if 'channel' in args.prompt_mode:
-            prompt2 = self.t2i2(semantic_prompt)
-            if mixed:
-                prompt2 = mix_prompt(prompt2).unsqueeze(0).repeat(x.shape[0], 1)
+        # weighted=True: semantic_prompt is [N, text_dim] candidate features;
+        # per-sample weighted mixing is computed at the injection layer instead.
+        if not weighted:
+            if 'spatial' in args.prompt_mode:
+                prompt1 = self.t2i(semantic_prompt)
+                if mixed:
+                    prompt1 = mix_prompt(prompt1).unsqueeze(0).repeat(x.shape[0], 1)
+            if 'channel' in args.prompt_mode:
+                prompt2 = self.t2i2(semantic_prompt)
+                if mixed:
+                    prompt2 = mix_prompt(prompt2).unsqueeze(0).repeat(x.shape[0], 1)
 
         if self.using_stem:
             x = self.stem(x)
@@ -473,6 +495,8 @@ class Visformer(nn.Module):
         for b in self.stage2:
             if np.absolute(stage - args.stage) < 1e-6:
                 B, C, H, W = x.shape
+                if weighted:
+                    prompt1, prompt2 = self._weighted_prompt(x, semantic_prompt, args)
                 if 'channel' in args.prompt_mode:
                     context = x.view(B, C, -1).mean(-1)
                     context = torch.cat([context, prompt2], dim=-1)
@@ -497,6 +521,8 @@ class Visformer(nn.Module):
         for b in self.stage3:
             if np.absolute(stage - args.stage) < 1e-6:
                 B, C, H, W = x.shape
+                if weighted:
+                    prompt1, prompt2 = self._weighted_prompt(x, semantic_prompt, args)
                 if 'channel' in args.prompt_mode:
                     context = x.view(B, C, -1).mean(-1)
                     context = torch.cat([context, prompt2], dim=-1)
