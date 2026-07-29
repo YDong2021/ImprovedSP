@@ -217,13 +217,11 @@ def get_text_feature(teacher, dataset, args):
 
 def forward_query_with_mixed_prompt(student, que, cand_text, args):
     # query labels are unknown: inject the averaged prompt of all candidate
-    # classes (mixed semantic prompt) on both spatial and channel dimensions
-    if args.prompt_mode == 'spatial':
-        que_prompt = visformer.mix_prompt(student.t2i(cand_text))
-        que_prompt = que_prompt.unsqueeze(0).repeat(que.shape[0], 1)
-        return student.forward_with_semantic_prompt(que, que_prompt, args)
-    else:
-        return student.forward_with_semantic_prompt_channel(que, cand_text, args, mixed=True)
+    # classes (mixed semantic prompt) on the spatial dimension only,
+    # no channel-wise modulation for query samples
+    que_prompt = visformer.mix_prompt(student.t2i(cand_text))
+    que_prompt = que_prompt.unsqueeze(0).repeat(que.shape[0], 1)
+    return student.forward_with_semantic_prompt(que, que_prompt, args)
 
 
 def train(text, student, train_loader, optim, epoch, args):
