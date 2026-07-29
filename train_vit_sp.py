@@ -112,35 +112,12 @@ def main(args):
     else:
         raise ValueError(f'unknown model: {args.model}')
 
-    feature_dim = 384
-    if 2 <= args.stage < 3:
-        feature_dim = 192
-    if args.projector == 'linear':
-        student.t2i = torch.nn.Linear(text_dim, feature_dim, bias=False)
-    elif args.projector == 'mlp':
-        student.t2i = torch.nn.Sequential(torch.nn.Linear(text_dim, text_dim),
-                                          torch.nn.ReLU(),
-                                          torch.nn.Linear(text_dim, feature_dim, bias=False))
-    elif args.projector == 'mlp3':
-        student.t2i = torch.nn.Sequential(torch.nn.Linear(text_dim, text_dim),
-                                          torch.nn.ReLU(),
-                                          torch.nn.Linear(text_dim, text_dim),
-                                          torch.nn.ReLU(),
-                                          torch.nn.Linear(text_dim, feature_dim, bias=False))
-
-    if 'channel' in args.prompt_mode:
-        student.t2i2 = torch.nn.Linear(text_dim, feature_dim, bias=False)
-        student.se_block = torch.nn.Sequential(torch.nn.Linear(feature_dim*2, feature_dim, bias=True),
-                                               torch.nn.Sigmoid(),
-                                               torch.nn.Linear(feature_dim, feature_dim),
-                                               torch.nn.Sigmoid(),)
+    # semantic prompt via cross-attention at the 3rd and the 4th block of stage3
+    student.build_semantic_cross_attn(text_dim, layers=(2, 3))
 
     student = student.cuda(args.gpu)
 
-    optim_params_id = [id(param) for param in student.t2i.parameters()]
-    if 'channel' in args.prompt_mode:
-        optim_params_id += [id(param) for param in student.t2i2.parameters()]  # se_block is not included. use smaller lr for se_block
-        # optim_params_id += [id(param) for param in student.se_block.parameters()]
+    optim_params_id = [id(param) for param in student.sem_cross.parameters()]
     optim_params = [param for param in student.parameters() if id(param) in optim_params_id]
     other_params = [param for param in student.parameters() if id(param) not in optim_params_id]
     if args.optim == 'sgd':
@@ -231,11 +208,7 @@ def train(text, student, train_loader, optim, epoch, args):
         glabels = glabels.view(args.train_way, args.shot+15)[:, :args.shot]
         glabels = glabels.contiguous().view(-1)
         text_features = text[glabels]
-        if args.prompt_mode == 'spatial':
-            text_features = student.t2i(text_features)
-            _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
-        else:
-            _, sup_im_features = student.forward_with_semantic_prompt_channel(sup, text_features, args)
+        _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features)
 
         sup_im_features = sup_im_features.view(args.train_way, args.shot, -1).mean(dim=1)
 
@@ -276,11 +249,7 @@ def test(text, student, test_loader, epoch, args):
                 glabels = glabels.view(args.way, args.shot + 15)[:, :args.shot]
                 glabels = glabels.contiguous().view(-1)
                 text_features = text[glabels]
-                if args.prompt_mode == 'spatial':
-                    text_features = student.t2i(text_features)
-                    _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
-                else:
-                    _, sup_im_features = student.forward_with_semantic_prompt_channel(sup, text_features, args)
+                _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features)
                 _, que_im_features = student(que)
 
                 if args.test_classifier == 'prototype':
@@ -316,13 +285,7 @@ def test(text, student, test_loader, epoch, args):
                 glabels = glabels.view(args.way, args.shot + 15)[:, :args.shot]
                 glabels = glabels.unsqueeze(0).repeat(args.aug_support, 1, 1).contiguous().view(-1)
                 text_features = text[glabels]
-                # text_features = student.t2i(text_features)
-                # _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
-                if args.prompt_mode == 'spatial':
-                    text_features = student.t2i(text_features)
-                    _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
-                else:
-                    _, sup_im_features = student.forward_with_semantic_prompt_channel(sup, text_features, args)
+                _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features)
 
                 _, que_im_features = student(que)
 
@@ -373,12 +336,8 @@ if __name__ == '__main__':
     parser.add_argument('--aug_support', type=int, default=1)
     parser.add_argument('--model', type=str, default='visformer-t', choices=['visformer-t', 'visformer-t-84'])
     parser.add_argument('--nlp_model', type=str, default='clip', choices=['clip', 'glove', 'mpnet'])
-    parser.add_argument('--prompt_mode', type=str, default='spatial+channel', choices=['spatial', 'channel', 'spatial+channel'])
     parser.add_argument('--no_template', action='store_true')
     parser.add_argument('--eqnorm', action='store_true', default=True)
-    parser.add_argument('--stage', type=float, default=3.2, choices=[2, 2.1, 2.2, 2.3, 3, 3.1, 3.2, 3.3])
-    parser.add_argument('--projector', type=str, default='linear', choices=['linear', 'mlp', 'mlp3'])
-    parser.add_argument('--avg', type=str, default='all', choices=['all', 'patch', 'head'])
     parser.add_argument('--t', type=float, default=0.2)
     parser.add_argument('--optim', type=str, default='adamw', choices=['sgd', 'adamw'])
     parser.add_argument('--lr', type=float, default=5e-4)

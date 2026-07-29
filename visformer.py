@@ -1,6 +1,5 @@
 # https://github.com/danczs/Visformer/blob/main/models.py
 
-import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -111,24 +110,69 @@ class Attention(nn.Module):
         B, C, H, W = x.shape
         x = self.qkv(x)
         qkv = rearrange(x, 'b (x y z) h w -> x b y (h w) z', x=3, y=self.num_heads, z=self.head_dim)
-        # changed by wentao to add a semantic prompt
-        if H != W:
-            qkv = qkv[:, :, :, :(H-1)*W+1]
         q, k, v = qkv[0], qkv[1], qkv[2]
         attn = ( (q * self.scale) @ (k.transpose(-2,-1) * self.scale) )
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
         x = attn @ v
-        if H != W:
-            semantic_token = x[:, :, (H-1)*W:(H-1)*W+1]
-            semantic_token = semantic_token.repeat(1, 1, W-1, 1)
-            x = torch.cat([x, semantic_token], dim=2)
 
         x = rearrange(x, 'b y (h w) z -> b (y z) h w', h=H, w=W)
         x = self.proj(x)
         x = self.proj_drop(x)
 
         return x
+
+
+class SemanticCrossAttention(nn.Module):
+    """Cross-attention between the semantic token and the visual tokens.
+
+    The semantic token (projected text feature) provides the query, and the visual tokens
+    provide the key and the value. The attention weights of the single semantic query are
+    used to gate the value of every visual token, so the module outputs the updated visual
+    tokens instead of one aggregated vector. The output projection is zero-initialized,
+    hence the module is an identity mapping at the beginning of meta-training.
+    """
+    def __init__(self, dim, text_dim, num_heads=3, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.dim = dim
+        self.text_dim = text_dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.head_dim = head_dim
+        # split the scale over q and k to avoid NAN when using amp, as in Attention
+        qk_scale_factor = qk_scale if qk_scale is not None else -0.25
+        self.scale = head_dim ** qk_scale_factor
+
+        self.q = nn.Linear(text_dim, head_dim * num_heads, bias=False)
+        self.norm = BatchNorm(dim)
+        self.kv = nn.Conv2d(dim, head_dim * num_heads * 2, 1, stride=1, padding=0, bias=False)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Conv2d(head_dim * num_heads, dim, 1, stride=1, padding=0, bias=False)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        trunc_normal_(self.q.weight, std=0.02)
+        trunc_normal_(self.kv.weight, std=0.02)
+        nn.init.zeros_(self.proj.weight)
+
+    def forward(self, x, text_feature):
+        B, C, H, W = x.shape
+        M = H * W
+        y = self.norm(x)
+        kv = rearrange(self.kv(y), 'b (x y z) h w -> x b y (h w) z', x=2, y=self.num_heads, z=self.head_dim)
+        k, v = kv[0], kv[1]  # B, num_heads, M, head_dim
+        q = self.q(text_feature).view(B, self.num_heads, 1, self.head_dim)
+
+        attn = ( (q * self.scale) @ (k.transpose(-2, -1) * self.scale) )  # B, num_heads, 1, M
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        # gate the value of each visual token. multiplying by M keeps the average gate near 1
+        gate = attn.transpose(-2, -1) * M  # B, num_heads, M, 1
+        out = v * gate
+        out = rearrange(out, 'b y (h w) z -> b (y z) h w', h=H, w=W)
+        out = self.proj_drop(self.proj(out))
+
+        return x + out
 
 
 class Block(nn.Module):
@@ -189,6 +233,7 @@ class Visformer(nn.Module):
         super().__init__()
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim
+        self.num_heads = num_heads
         self.init_channels = init_channels
         self.img_size = img_size
         self.vit_embedding = vit_embedding
@@ -364,8 +409,20 @@ class Visformer(nn.Module):
         logit = self.head( x.view(x.size(0), -1) )
         return logit, x.squeeze()
 
-    # added by wentao for semantic_prompt
-    def forward_with_semantic_prompt(self, x, semantic_prompt, args):
+    # semantic prompt via cross-attention
+    def build_semantic_cross_attn(self, text_dim, layers=(2, 3)):
+        """Attach a SemanticCrossAttention module in front of the selected blocks of stage3."""
+        assert not self.vit_embedding, 'semantic cross-attention assumes the conv-stem Visformer'
+        for i in layers:
+            assert i < len(self.stage3), f'stage3 has {len(self.stage3)} blocks, got layer index {i}'
+        self.sem_cross_layers = tuple(layers)
+        self.sem_cross = nn.ModuleList([
+            SemanticCrossAttention(self.embed_dim * 2, text_dim, num_heads=self.num_heads)
+            for _ in self.sem_cross_layers
+        ])
+        return self.sem_cross
+
+    def forward_with_semantic_prompt(self, x, text_feature):
         if self.using_stem:
             x = self.stem(x)
 
@@ -383,128 +440,24 @@ class Visformer(nn.Module):
             if self.pos_embed:
                 x = x + self.pos_embed2
                 x = self.pos_drop(x)
-        stage = 2.0
         for b in self.stage2:
-            if np.absolute(stage - args.stage) < 1e-6:
-                B, C, H, W = x.shape
-                semantic_prompt = semantic_prompt.view(B, C, 1, 1).repeat(1, 1, 1, W)
-                x = torch.cat([x, semantic_prompt], dim=2)
             x = b(x)
-            stage += 0.1
-        if 2 <= args.stage < 3:
-            x = x[:, :, :H]
 
-        # stage3
+        # stage 3. the semantic token queries the visual tokens before the selected blocks
         if not self.vit_embedding:
             x = self.patch_embed3(x)
             if self.pos_embed:
                 x = x + self.pos_embed3
                 x = self.pos_drop(x)
-        stage = 3.0
-        for b in self.stage3:
-            if np.absolute(stage - args.stage) < 1e-6:
-                B, C, H, W = x.shape
-                semantic_prompt = semantic_prompt.view(B, C, 1, 1).repeat(1, 1, 1, W)
-                x = torch.cat([x, semantic_prompt], dim=2)
+        for i, b in enumerate(self.stage3):
+            if i in self.sem_cross_layers:
+                x = self.sem_cross[self.sem_cross_layers.index(i)](x, text_feature)
             x = b(x)
-            stage += 0.1
 
-        # head
+        # head. the prototype is computed from all the visual tokens
         x = self.norm(x)
         if self.pool:
-            # x = self.global_pooling(x)
-            if args.stage >= 3:
-                B, C, H, W = x.shape
-                if args.avg == 'all':
-                    x = x.view(B, C, -1)[:, :, :(H-1)*W+1].mean(-1)
-                elif args.avg == 'patch':
-                    x = x.view(B, C, -1)[:, :, :(H-1)*W].mean(-1)
-                elif args.avg == 'head':
-                    x = x.view(B, C, -1) [:, :, -1]
-            else:
-                x = self.global_pooling(x)
-        else:
-            x = x[:, :, 0, 0]
-
-        logit = self.head( x.view(x.size(0), -1) )
-        return logit, x.squeeze()
-
-    def forward_with_semantic_prompt_channel(self, x, semantic_prompt, args):
-        if 'spatial' in args.prompt_mode:
-            prompt1 = self.t2i(semantic_prompt)
-        if 'channel' in args.prompt_mode:
-            prompt2 = self.t2i2(semantic_prompt)
-
-        if self.using_stem:
-            x = self.stem(x)
-
-        # stage 1
-        x = self.patch_embed1(x)
-        if self.pos_embed:
-            x = x + self.pos_embed1
-            x = self.pos_drop(x)
-        for b in self.stage1:
-            x = b(x)
-
-        # stage 2
-        if not self.vit_embedding:
-            x = self.patch_embed2(x)
-            if self.pos_embed:
-                x = x + self.pos_embed2
-                x = self.pos_drop(x)
-        stage = 2.0
-        for b in self.stage2:
-            if np.absolute(stage - args.stage) < 1e-6:
-                B, C, H, W = x.shape
-                if 'channel' in args.prompt_mode:
-                    context = x.view(B, C, -1).mean(-1)
-                    context = torch.cat([context, prompt2], dim=-1)
-                    context = self.se_block(context)
-                    context = context - context.mean(dim=-1, keepdim=True)
-                    x = x + context.view(B, C, 1, 1)
-                if 'spatial' in args.prompt_mode:
-                    prompt1 = prompt1.view(B, C, 1, 1).repeat(1, 1, 1, W)
-                    x = torch.cat([x, prompt1], dim=2)
-            x = b(x)
-            stage += 0.1
-        if 'spatial' in args.prompt_mode and 2 <= args.stage < 3:
-            x = x[:, :, :H]
-
-        # stage3
-        if not self.vit_embedding:
-            x = self.patch_embed3(x)
-            if self.pos_embed:
-                x = x + self.pos_embed3
-                x = self.pos_drop(x)
-        stage = 3.0
-        for b in self.stage3:
-            if np.absolute(stage - args.stage) < 1e-6:
-                B, C, H, W = x.shape
-                if 'channel' in args.prompt_mode:
-                    context = x.view(B, C, -1).mean(-1)
-                    context = torch.cat([context, prompt2], dim=-1)
-                    context = self.se_block(context)
-                    context = context - context.mean(dim=-1, keepdim=True)
-                    x = x + context.view(B, C, 1, 1)
-                if 'spatial' in args.prompt_mode:
-                    prompt1 = prompt1.view(B, C, 1, 1).repeat(1, 1, 1, W)
-                    x = torch.cat([x, prompt1], dim=2)
-            x = b(x)
-            stage += 0.1
-
-        # head
-        x = self.norm(x)
-        if self.pool:
-            if 'spatial' not in args.prompt_mode or args.stage < 3:
-                x = self.global_pooling(x)
-            else:
-                B, C, H, W = x.shape
-                if args.avg == 'all':
-                    x = x.view(B, C, -1)[:, :, :(H - 1) * W + 1].mean(-1)
-                elif args.avg == 'patch':
-                    x = x.view(B, C, -1)[:, :, :(H - 1) * W].mean(-1)
-                elif args.avg == 'head':
-                    x = x.view(B, C, -1)[:, :, -1]
+            x = self.global_pooling(x)
         else:
             x = x[:, :, 0, 0]
 
