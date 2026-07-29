@@ -22,6 +22,16 @@ def drop_path(x, drop_prob:float = 0., training: bool = False):
     return output
 
 
+# added for mixed semantic prompt on query samples:
+# average the prompt tokens of all candidate classes and re-normalize
+# to the average norm of the single-class tokens
+def mix_prompt(prompt):
+    # prompt: [N, C] projected prompt tokens of the N candidate classes
+    avg_norm = prompt.norm(dim=-1).mean()
+    mixed = F.normalize(prompt.mean(dim=0), dim=-1) * avg_norm
+    return mixed
+
+
 class DropPath(nn.Module):
     def __init__(self, drop_prob=None):
         super(DropPath, self).__init__()
@@ -429,11 +439,18 @@ class Visformer(nn.Module):
         logit = self.head( x.view(x.size(0), -1) )
         return logit, x.squeeze()
 
-    def forward_with_semantic_prompt_channel(self, x, semantic_prompt, args):
+    def forward_with_semantic_prompt_channel(self, x, semantic_prompt, args, mixed=False):
+        # mixed=True: semantic_prompt is [N, text_dim] features of the N candidate
+        # classes (query samples, label unknown). project each class, then average
+        # into a single mixed prompt shared by the whole batch.
         if 'spatial' in args.prompt_mode:
             prompt1 = self.t2i(semantic_prompt)
+            if mixed:
+                prompt1 = mix_prompt(prompt1).unsqueeze(0).repeat(x.shape[0], 1)
         if 'channel' in args.prompt_mode:
             prompt2 = self.t2i2(semantic_prompt)
+            if mixed:
+                prompt2 = mix_prompt(prompt2).unsqueeze(0).repeat(x.shape[0], 1)
 
         if self.using_stem:
             x = self.stem(x)

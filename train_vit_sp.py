@@ -215,6 +215,17 @@ def get_text_feature(teacher, dataset, args):
     return text_feature
 
 
+def forward_query_with_mixed_prompt(student, que, cand_text, args):
+    # query labels are unknown: inject the averaged prompt of all candidate
+    # classes (mixed semantic prompt) on both spatial and channel dimensions
+    if args.prompt_mode == 'spatial':
+        que_prompt = visformer.mix_prompt(student.t2i(cand_text))
+        que_prompt = que_prompt.unsqueeze(0).repeat(que.shape[0], 1)
+        return student.forward_with_semantic_prompt(que, que_prompt, args)
+    else:
+        return student.forward_with_semantic_prompt_channel(que, cand_text, args, mixed=True)
+
+
 def train(text, student, train_loader, optim, epoch, args):
     student.train()
     losses = 0.
@@ -239,7 +250,8 @@ def train(text, student, train_loader, optim, epoch, args):
 
         sup_im_features = sup_im_features.view(args.train_way, args.shot, -1).mean(dim=1)
 
-        _, que_im_features = student(que)
+        cand_glabels = glabels.view(args.train_way, args.shot)[:, 0]
+        _, que_im_features = forward_query_with_mixed_prompt(student, que, text[cand_glabels], args)
 
         sim = F.normalize(que_im_features, dim=-1) @ F.normalize(sup_im_features, dim=-1).t()
         loss = F.cross_entropy(sim / args.t, labels)
@@ -281,7 +293,11 @@ def test(text, student, test_loader, epoch, args):
                     _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
                 else:
                     _, sup_im_features = student.forward_with_semantic_prompt_channel(sup, text_features, args)
-                _, que_im_features = student(que)
+                if args.test_classifier == 'prototype':
+                    cand_glabels = glabels.view(args.way, args.shot)[:, 0]
+                    _, que_im_features = forward_query_with_mixed_prompt(student, que, text[cand_glabels], args)
+                else:
+                    _, que_im_features = student(que)
 
                 if args.test_classifier == 'prototype':
                     sup_im_features = sup_im_features.view(args.way, args.shot, -1).mean(dim=1)
