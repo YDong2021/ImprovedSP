@@ -440,14 +440,21 @@ class Visformer(nn.Module):
         return logit, x.squeeze()
 
     # added for weighted mixed semantic prompt on query samples:
-    # match the visual context at the injection layer with each candidate
+    # match the visual tokens at the injection layer with each candidate
     # prompt token (cosine in the t2i space), then average the candidate
-    # tokens with softmax weights and re-normalize
+    # tokens with softmax weights and re-normalize.
+    # sim_mode='global': cosine with the mean-pooled visual context;
+    # sim_mode='max': cosine with every patch token, take the max over patches
     def _weighted_prompt(self, x, cand_text, args):
         B, C = x.shape[0], x.shape[1]
         p1 = self.t2i(cand_text)  # [N, C]
-        ctx = x.view(B, C, -1).mean(-1)  # [B, C]
-        sim = F.normalize(ctx, dim=-1) @ F.normalize(p1, dim=-1).t()  # [B, N]
+        if args.sim_mode == 'global':
+            ctx = x.view(B, C, -1).mean(-1)  # [B, C]
+            sim = F.normalize(ctx, dim=-1) @ F.normalize(p1, dim=-1).t()  # [B, N]
+        else:
+            patches = F.normalize(x.view(B, C, -1), dim=1)  # [B, C, M]
+            sim = torch.einsum('bcm,nc->bnm', patches, F.normalize(p1, dim=-1))  # [B, N, M]
+            sim = sim.max(dim=-1)[0]  # [B, N]
         weights = (sim / args.sim_t).softmax(dim=-1)
         prompt1 = weights @ p1  # [B, C]
         prompt1 = F.normalize(prompt1, dim=-1) * p1.norm(dim=-1).mean()
