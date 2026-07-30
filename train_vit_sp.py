@@ -115,9 +115,6 @@ def main(args):
     feature_dim = 384
     if 2 <= args.stage < 3:
         feature_dim = 192
-    if args.prompt_layer == 'dynamic':
-        # dynamic mode always searches the 4 blocks of stage3 (dim=384)
-        feature_dim = 384
     if args.projector == 'linear':
         student.t2i = torch.nn.Linear(text_dim, feature_dim, bias=False)
     elif args.projector == 'mlp':
@@ -138,12 +135,25 @@ def main(args):
                                                torch.nn.Linear(feature_dim, feature_dim),
                                                torch.nn.Sigmoid(),)
 
+    if args.prompt_layer == 'dynamic':
+        # plan A: Gumbel-Softmax router over the stage3 layers, class-level decision from text features
+        num_inject_layers = len(student.stage3)
+        student.router = torch.nn.Sequential(torch.nn.Linear(text_dim, 128),
+                                             torch.nn.ReLU(),
+                                             torch.nn.Linear(128, num_inject_layers))
+        # warm start: bias the router towards layer 3.2 (index 2, the known-best fixed layer)
+        with torch.no_grad():
+            student.router[2].bias.zero_()
+            student.router[2].bias[2] = 2.0
+
     student = student.cuda(args.gpu)
 
     optim_params_id = [id(param) for param in student.t2i.parameters()]
     if 'channel' in args.prompt_mode:
         optim_params_id += [id(param) for param in student.t2i2.parameters()]  # se_block is not included. use smaller lr for se_block
         # optim_params_id += [id(param) for param in student.se_block.parameters()]
+    if args.prompt_layer == 'dynamic':
+        optim_params_id += [id(param) for param in student.router.parameters()]
     optim_params = [param for param in student.parameters() if id(param) in optim_params_id]
     other_params = [param for param in student.parameters() if id(param) not in optim_params_id]
     if args.optim == 'sgd':
@@ -218,10 +228,17 @@ def get_text_feature(teacher, dataset, args):
     return text_feature
 
 
+def hard_gate(student, text_features):
+    # test-time routing: one-hot on the argmax layer, no Gumbel sampling
+    logits = student.router(text_features)
+    return F.one_hot(logits.argmax(dim=-1), num_classes=logits.shape[-1]).float()
+
+
 def train(text, student, train_loader, optim, epoch, args):
     student.train()
     losses = 0.
     accs = 0.
+    route_probs = 0.
     for idx, episode in enumerate(train_loader):
         image = episode[0].cuda(args.gpu)  # way * (shot+15)
         glabels = episode[1].cuda(args.gpu)
@@ -235,7 +252,13 @@ def train(text, student, train_loader, optim, epoch, args):
         glabels = glabels.contiguous().view(-1)
         text_features = text[glabels]
         if args.prompt_layer == 'dynamic':
-            _, sup_im_features = student.forward_with_semantic_prompt_dynamic(sup, text_features, args)
+            # linear tau annealing over the whole training
+            progress = epoch / max(args.epochs - 1, 1)
+            tau = args.gumbel_tau_start + (args.gumbel_tau_end - args.gumbel_tau_start) * progress
+            logits = student.router(text_features)
+            gate = F.gumbel_softmax(logits, tau=tau, hard=False, dim=-1)
+            route_probs = route_probs + logits.softmax(dim=-1).mean(0).detach()
+            _, sup_im_features = student.forward_with_dynamic_prompt(sup, text_features, gate, args)
         elif args.prompt_mode == 'spatial':
             text_features = student.t2i(text_features)
             _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
@@ -248,6 +271,11 @@ def train(text, student, train_loader, optim, epoch, args):
 
         sim = F.normalize(que_im_features, dim=-1) @ F.normalize(sup_im_features, dim=-1).t()
         loss = F.cross_entropy(sim / args.t, labels)
+        if args.prompt_layer == 'dynamic' and args.entropy_reg > 0:
+            # entropy bonus on the router distribution, decayed to 0 to allow one-hot convergence
+            p = logits.softmax(dim=-1)
+            entropy = -(p * p.clamp_min(1e-9).log()).sum(dim=-1).mean()
+            loss = loss - args.entropy_reg * (1 - progress) * entropy
         losses += loss.item()
         _, pred = sim.max(-1)
         accs += labels.eq(pred).sum().float().item() / labels.shape[0]
@@ -261,6 +289,12 @@ def train(text, student, train_loader, optim, epoch, args):
             print(print_string)
     args.logger.add_scalar('train/loss', losses / len(train_loader), epoch)
     args.logger.add_scalar('train/acc', accs / len(train_loader), epoch)
+    if args.prompt_layer == 'dynamic':
+        route_probs = route_probs / len(train_loader)
+        print('router probs:', [f'{p:.3f}' for p in route_probs.tolist()], f'tau: {tau:.3f}')
+        for l in range(route_probs.shape[-1]):
+            args.logger.add_scalar(f'train/route_p{l}', route_probs[l].item(), epoch)
+        args.logger.add_scalar('train/gumbel_tau', tau, epoch)
 
 
 def test(text, student, test_loader, epoch, args):
@@ -282,7 +316,8 @@ def test(text, student, test_loader, epoch, args):
                 glabels = glabels.contiguous().view(-1)
                 text_features = text[glabels]
                 if args.prompt_layer == 'dynamic':
-                    _, sup_im_features = student.forward_with_semantic_prompt_dynamic(sup, text_features, args)
+                    _, sup_im_features = student.forward_with_dynamic_prompt(
+                        sup, text_features, hard_gate(student, text_features), args)
                 elif args.prompt_mode == 'spatial':
                     text_features = student.t2i(text_features)
                     _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
@@ -326,7 +361,8 @@ def test(text, student, test_loader, epoch, args):
                 # text_features = student.t2i(text_features)
                 # _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
                 if args.prompt_layer == 'dynamic':
-                    _, sup_im_features = student.forward_with_semantic_prompt_dynamic(sup, text_features, args)
+                    _, sup_im_features = student.forward_with_dynamic_prompt(
+                        sup, text_features, hard_gate(student, text_features), args)
                 elif args.prompt_mode == 'spatial':
                     text_features = student.t2i(text_features)
                     _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
@@ -383,8 +419,10 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='visformer-t', choices=['visformer-t', 'visformer-t-84'])
     parser.add_argument('--nlp_model', type=str, default='clip', choices=['clip', 'glove', 'mpnet'])
     parser.add_argument('--prompt_mode', type=str, default='spatial+channel', choices=['spatial', 'channel', 'spatial+channel'])
-    parser.add_argument('--prompt_layer', type=str, default='fixed', choices=['fixed', 'dynamic'],
-                        help='fixed: inject at args.stage; dynamic: per-sample select the best stage3 layer')
+    parser.add_argument('--prompt_layer', type=str, default='fixed', choices=['fixed', 'dynamic'])
+    parser.add_argument('--gumbel_tau_start', type=float, default=5.)
+    parser.add_argument('--gumbel_tau_end', type=float, default=0.5)
+    parser.add_argument('--entropy_reg', type=float, default=0.01)
     parser.add_argument('--no_template', action='store_true')
     parser.add_argument('--eqnorm', action='store_true', default=True)
     parser.add_argument('--stage', type=float, default=3.2, choices=[2, 2.1, 2.2, 2.3, 3, 3.1, 3.2, 3.3])

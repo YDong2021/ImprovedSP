@@ -511,41 +511,27 @@ class Visformer(nn.Module):
         logit = self.head( x.view(x.size(0), -1) )
         return logit, x.squeeze()
 
-    # added by wentao for dynamic prompt-injection-layer selection
-    def forward_with_semantic_prompt_dynamic(self, x, semantic_prompt, args):
-        """Dynamically choose which stage3 layer to inject the prompt into.
+    # dynamic prompt injection (plan A): gate is a (B, len(stage3)) weight matrix from the
+    # Gumbel-Softmax router. SI uses a persistent prompt row that accumulates w_l * prompt
+    # before each stage3 layer; CI adds w_l * beta_l to the patch tokens at every layer.
+    def forward_with_dynamic_prompt(self, x, semantic_prompt, gate, args):
+        if 'spatial' in args.prompt_mode:
+            prompt1 = self.t2i(semantic_prompt)
+        if 'channel' in args.prompt_mode:
+            prompt2 = self.t2i2(semantic_prompt)
 
-        Procedure (per support sample):
-          1. Probe: run stage3's blocks WITHOUT any prompt, cache the input of
-             every block (i.e. the clean intermediate feature maps).
-          2. Trial: for each candidate block l, inject a spatial (SI) prompt row
-             into the cached clean input x_l, run ONLY block l, and measure the
-             token-wise cosine distance between its output y_l (first 49 patch
-             tokens) and the clean output x_{l+1}. Difference is caused purely by
-             the prompt.
-          3. Select l* = argmax_l diff  (per sample, non-differentiable).
-          4. Official: re-run stage3 from the stage2 output, injecting SI(+CI)
-             only at l* for each sample, and produce the final features.
-
-        Note: this mode searches the 4 blocks of stage3, so it expects the
-        feature dim to be 384 (i.e. the projectors t2i / t2i2 map into 384).
-        """
-        assert 'spatial' in args.prompt_mode, \
-            'dynamic mode relies on spatial injection for the probe step'
-
-        # project the raw text feature into the visual space
-        prompt1 = self.t2i(semantic_prompt)                      # SI prompt (B, C)
-        prompt2 = self.t2i2(semantic_prompt) if 'channel' in args.prompt_mode else None
-
-        # ---- shared trunk: stem + stage1 + stage2 + patch_embed3 (run once) ----
         if self.using_stem:
             x = self.stem(x)
+
+        # stage 1
         x = self.patch_embed1(x)
         if self.pos_embed:
             x = x + self.pos_embed1
             x = self.pos_drop(x)
         for b in self.stage1:
             x = b(x)
+
+        # stage 2 (no injection in dynamic mode)
         if not self.vit_embedding:
             x = self.patch_embed2(x)
             if self.pos_embed:
@@ -553,65 +539,28 @@ class Visformer(nn.Module):
                 x = self.pos_drop(x)
         for b in self.stage2:
             x = b(x)
+
+        # stage3
         if not self.vit_embedding:
             x = self.patch_embed3(x)
             if self.pos_embed:
                 x = x + self.pos_embed3
                 x = self.pos_drop(x)
-        feat0 = x                                                # input to stage3 block 0
-
-        # ---- steps 1-3: probe + trial + selection (no grad, selection is a rule) ----
-        with torch.no_grad():
-            xc = feat0.detach()
-            inter = [xc]
-            for b in self.stage3:
-                xc = b(xc)
-                inter.append(xc)                                 # inter[l+1] = clean output of block l
-
-            prompt1_d = prompt1.detach()
-            diffs = []
-            for l, b in enumerate(self.stage3):
-                xl = inter[l]
-                B, C, H, W = xl.shape
-                p = prompt1_d.view(B, C, 1, 1).repeat(1, 1, 1, W)
-                xin = torch.cat([xl, p], dim=2)                  # (B, C, H+1, W)
-                yl = b(xin)
-                yl_patch = yl.reshape(B, C, -1)[:, :, :H * W]     # first 49 patch tokens
-                xn_patch = inter[l + 1].reshape(B, C, -1)[:, :, :H * W]
-                cos = F.cosine_similarity(yl_patch, xn_patch, dim=1)  # (B, 49)
-                diffs.append((1. - cos).mean(dim=1))             # (B,)
-            diffs = torch.stack(diffs, dim=1)                    # (B, num_stage3_blocks)
-            l_star = diffs.argmax(dim=1)                         # (B,)
-
-        # ---- step 4: official forward, per selected-layer group (with grad) ----
-        B = feat0.size(0)
-        feat_dim = self.num_features * (1 if self.vit_embedding else 2)
-        feats_out = feat0.new_zeros(B, feat_dim)
-        logit_out = feat0.new_zeros(B, self.num_classes)
-        for g in torch.unique(l_star).tolist():
-            mask = (l_star == g)
-            sub_p2 = prompt2[mask] if prompt2 is not None else None
-            lg, fg = self._run_stage3_inject(feat0[mask], prompt1[mask], sub_p2, int(g), args)
-            logit_out[mask] = lg
-            feats_out[mask] = fg
-
-        return logit_out, feats_out
-
-    def _run_stage3_inject(self, x, prompt1, prompt2, inject_idx, args):
-        """Run stage3 blocks on `x` (input to block 0), injecting SI(+CI) at
-        block `inject_idx`. Returns (logit, features). Used by the dynamic mode."""
-        for i, b in enumerate(self.stage3):
-            if i == inject_idx:
-                B, C, H, W = x.shape
-                if 'channel' in args.prompt_mode and prompt2 is not None:
-                    context = x.view(B, C, -1).mean(-1)
-                    context = torch.cat([context, prompt2], dim=-1)
-                    context = self.se_block(context)
-                    context = context - context.mean(dim=-1, keepdim=True)
-                    x = x + context.view(B, C, 1, 1)
-                if 'spatial' in args.prompt_mode:
-                    p = prompt1.view(B, C, 1, 1).repeat(1, 1, 1, W)
-                    x = torch.cat([x, p], dim=2)
+        B, C, H, W = x.shape
+        if 'spatial' in args.prompt_mode:
+            # persistent prompt row, kept until pooling. the sequence stays (H+1) x W so the
+            # H != W attention hack and the pooling logic work unchanged
+            x = torch.cat([x, torch.zeros(B, C, 1, W, dtype=x.dtype, device=x.device)], dim=2)
+        for l, b in enumerate(self.stage3):
+            w_l = gate[:, l].view(B, 1, 1, 1)
+            if 'channel' in args.prompt_mode:
+                context = x[:, :, :H].reshape(B, C, -1).mean(-1)
+                context = torch.cat([context, prompt2], dim=-1)
+                context = self.se_block(context)
+                context = context - context.mean(dim=-1, keepdim=True)
+                x = torch.cat([x[:, :, :H] + w_l * context.view(B, C, 1, 1), x[:, :, H:]], dim=2)
+            if 'spatial' in args.prompt_mode:
+                x = torch.cat([x[:, :, :H], x[:, :, H:] + w_l * prompt1.view(B, C, 1, 1)], dim=2)
             x = b(x)
 
         # head
@@ -630,9 +579,8 @@ class Visformer(nn.Module):
         else:
             x = x[:, :, 0, 0]
 
-        x = x.view(x.size(0), -1)
-        logit = self.head(x)
-        return logit, x
+        logit = self.head( x.view(x.size(0), -1) )
+        return logit, x.squeeze()
 
 
 def visformer_tiny(**kwargs):
