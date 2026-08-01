@@ -444,7 +444,9 @@ class Visformer(nn.Module):
     # prompt token (cosine in the t2i space), then average the candidate
     # tokens with softmax weights and re-normalize.
     # sim_mode='global': cosine with the mean-pooled visual context;
-    # sim_mode='max': cosine with every patch token, take the max over patches.
+    # sim_mode='max': cosine with every patch token, take the max over patches;
+    # sim_mode='attn': parameter-free cross-attention (semantic token as query,
+    # patch tokens as key/value), then cosine with the aggregated visual vector.
     # query samples use spatial-only injection, so only prompt1 (for SI) is
     # computed here; channel injection is skipped and prompt2 stays None.
     def _weighted_prompt(self, x, cand_text, args):
@@ -453,10 +455,16 @@ class Visformer(nn.Module):
         if args.sim_mode == 'global':
             ctx = x.view(B, C, -1).mean(-1)  # [B, C]
             sim = F.normalize(ctx, dim=-1) @ F.normalize(p1, dim=-1).t()  # [B, N]
-        else:
+        elif args.sim_mode == 'max':
             patches = F.normalize(x.view(B, C, -1), dim=1)  # [B, C, M]
             sim = torch.einsum('bcm,nc->bnm', patches, F.normalize(p1, dim=-1))  # [B, N, M]
             sim = sim.max(dim=-1)[0]  # [B, N]
+        else:
+            tokens = x.view(B, C, -1)  # [B, C, M]
+            attn = torch.einsum('nc,bcm->bnm', p1, tokens) / C ** 0.5  # [B, N, M]
+            attn = attn.softmax(dim=-1)  # joint softmax over the whole patch sequence
+            agg = torch.einsum('bnm,bcm->bnc', attn, tokens)  # [B, N, C]
+            sim = (F.normalize(agg, dim=-1) * F.normalize(p1, dim=-1).unsqueeze(0)).sum(-1)  # [B, N]
         weights = (sim / args.sim_t).softmax(dim=-1)
         prompt1 = weights @ p1  # [B, C]
         prompt1 = F.normalize(prompt1, dim=-1) * p1.norm(dim=-1).mean()
