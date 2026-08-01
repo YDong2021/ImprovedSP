@@ -440,38 +440,20 @@ class Visformer(nn.Module):
         return logit, x.squeeze()
 
     # added for weighted mixed semantic prompt on query samples:
-    # match the visual tokens at the injection layer with each candidate
+    # match the visual context at the injection layer with each candidate
     # prompt token (cosine in the t2i space), then average the candidate
     # tokens with softmax weights and re-normalize.
-    # sim_mode='global': cosine with the mean-pooled visual context;
-    # sim_mode='max': cosine with every patch token, take the max over patches;
-    # sim_mode='attn': parameter-free cross-attention (semantic token as query,
-    # patch tokens as key/value), then cosine with the aggregated visual vector
+    # query samples use spatial-only injection, so only prompt1 (for SI) is
+    # computed here; channel injection is skipped and prompt2 stays None.
     def _weighted_prompt(self, x, cand_text, args):
         B, C = x.shape[0], x.shape[1]
         p1 = self.t2i(cand_text)  # [N, C]
-        if args.sim_mode == 'global':
-            ctx = x.view(B, C, -1).mean(-1)  # [B, C]
-            sim = F.normalize(ctx, dim=-1) @ F.normalize(p1, dim=-1).t()  # [B, N]
-        elif args.sim_mode == 'max':
-            patches = F.normalize(x.view(B, C, -1), dim=1)  # [B, C, M]
-            sim = torch.einsum('bcm,nc->bnm', patches, F.normalize(p1, dim=-1))  # [B, N, M]
-            sim = sim.max(dim=-1)[0]  # [B, N]
-        else:
-            tokens = x.view(B, C, -1)  # [B, C, M]
-            attn = torch.einsum('nc,bcm->bnm', p1, tokens) / C ** 0.5  # [B, N, M]
-            attn = attn.softmax(dim=-1)  # joint softmax over the whole patch sequence
-            agg = torch.einsum('bnm,bcm->bnc', attn, tokens)  # [B, N, C]
-            sim = (F.normalize(agg, dim=-1) * F.normalize(p1, dim=-1).unsqueeze(0)).sum(-1)  # [B, N]
+        ctx = x.view(B, C, -1).mean(-1)  # [B, C]
+        sim = F.normalize(ctx, dim=-1) @ F.normalize(p1, dim=-1).t()  # [B, N]
         weights = (sim / args.sim_t).softmax(dim=-1)
         prompt1 = weights @ p1  # [B, C]
         prompt1 = F.normalize(prompt1, dim=-1) * p1.norm(dim=-1).mean()
-        prompt2 = None
-        if 'channel' in args.prompt_mode:
-            p2 = self.t2i2(cand_text)
-            prompt2 = weights @ p2
-            prompt2 = F.normalize(prompt2, dim=-1) * p2.norm(dim=-1).mean()
-        return prompt1, prompt2
+        return prompt1, None
 
     def forward_with_semantic_prompt_channel(self, x, semantic_prompt, args, mixed=False, weighted=False):
         # mixed=True: semantic_prompt is [N, text_dim] features of the N candidate
@@ -512,18 +494,18 @@ class Visformer(nn.Module):
                 B, C, H, W = x.shape
                 if weighted:
                     prompt1, prompt2 = self._weighted_prompt(x, semantic_prompt, args)
-                if 'channel' in args.prompt_mode:
+                if not weighted and 'channel' in args.prompt_mode:
                     context = x.view(B, C, -1).mean(-1)
                     context = torch.cat([context, prompt2], dim=-1)
                     context = self.se_block(context)
                     context = context - context.mean(dim=-1, keepdim=True)
                     x = x + context.view(B, C, 1, 1)
-                if 'spatial' in args.prompt_mode:
+                if weighted or 'spatial' in args.prompt_mode:
                     prompt1 = prompt1.view(B, C, 1, 1).repeat(1, 1, 1, W)
                     x = torch.cat([x, prompt1], dim=2)
             x = b(x)
             stage += 0.1
-        if 'spatial' in args.prompt_mode and 2 <= args.stage < 3:
+        if (weighted or 'spatial' in args.prompt_mode) and 2 <= args.stage < 3:
             x = x[:, :, :H]
 
         # stage3
@@ -538,13 +520,13 @@ class Visformer(nn.Module):
                 B, C, H, W = x.shape
                 if weighted:
                     prompt1, prompt2 = self._weighted_prompt(x, semantic_prompt, args)
-                if 'channel' in args.prompt_mode:
+                if not weighted and 'channel' in args.prompt_mode:
                     context = x.view(B, C, -1).mean(-1)
                     context = torch.cat([context, prompt2], dim=-1)
                     context = self.se_block(context)
                     context = context - context.mean(dim=-1, keepdim=True)
                     x = x + context.view(B, C, 1, 1)
-                if 'spatial' in args.prompt_mode:
+                if weighted or 'spatial' in args.prompt_mode:
                     prompt1 = prompt1.view(B, C, 1, 1).repeat(1, 1, 1, W)
                     x = torch.cat([x, prompt1], dim=2)
             x = b(x)
@@ -553,7 +535,7 @@ class Visformer(nn.Module):
         # head
         x = self.norm(x)
         if self.pool:
-            if 'spatial' not in args.prompt_mode or args.stage < 3:
+            if not (weighted or 'spatial' in args.prompt_mode) or args.stage < 3:
                 x = self.global_pooling(x)
             else:
                 B, C, H, W = x.shape

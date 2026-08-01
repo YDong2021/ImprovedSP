@@ -393,7 +393,6 @@ if __name__ == '__main__':
     parser.add_argument('--avg', type=str, default='all', choices=['all', 'patch', 'head'])
     parser.add_argument('--t', type=float, default=0.2)
     parser.add_argument('--sim_t', type=float, default=0.2)  # softmax temperature for weighted mixed prompt
-    parser.add_argument('--sim_mode', type=str, default='attn', choices=['global', 'max', 'attn'])  # visual-semantic similarity for prompt weighting
     parser.add_argument('--optim', type=str, default='adamw', choices=['sgd', 'adamw'])
     parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--weight_decay', type=float, default=5e-2)
