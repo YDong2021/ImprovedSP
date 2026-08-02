@@ -101,11 +101,7 @@ class DatasetWithTextLabel(object):
 
     def __getitem__(self, i):
         image, label = self.dataset[i]
-        text = self.dataset.classes[label]
-        text = self.idx2text[text]
-        # text prompt: A photo of a {label}
-        text = 'A photo of a ' + text
-        return image, label, text
+        return image, label, i
 
     def __len__(self):
         return len(self.dataset)

@@ -77,33 +77,39 @@ def main(args):
     # (segfault / worker memory corruption). the test loop tolerates single-process loading.
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_sampler=episode_sampler, num_workers=0)
 
-    if args.nlp_model == 'clip':
-        teacher, _ = clip.load("ViT-B/32", device='cuda:' + str(args.gpu))
+    if args.use_caption:
+        # instance-level: load pre-computed per-image CLIP features
         text_dim = 512
-        # set the max text length
-        if args.text_length != -1:
-            teacher.context_length = args.text_length
-            teacher.positional_embedding.data = teacher.positional_embedding.data[:args.text_length]
-            for layer in teacher.transformer.resblocks:
-                layer.attn_mask.data = layer.attn_mask.data[:args.text_length, :args.text_length]
-    elif args.nlp_model == 'mpnet':
-        teacher = SentenceTransformer('all-mpnet-base-v2', device=f'cuda:{args.gpu}')
-        text_dim = 768
-    elif args.nlp_model == 'glove':
-        teacher = SentenceTransformer('average_word_embeddings_glove.6B.300d', device=f'cuda:{args.gpu}')
-        text_dim = 300
+        train_text = torch.load(f'data/captions/{args.dataset}_train_clip_features.pt')
+        test_text = torch.load(f'data/captions/{args.dataset}_{args.split}_clip_features.pt')
+        print(f'Loaded caption features: train {train_text.shape}, test {test_text.shape}')
     else:
-        raise ValueError(f'unknown nlp_model: {args.nlp_model}')
-    train_text = get_text_feature(teacher, train_dataset, args)
-    test_text = get_text_feature(teacher, test_dataset, args)
-    if args.eqnorm:
-        if args.nlp_model in ['mpnet', 'glove']:
-            # the bert features have been normalized to unit length. use the avg norm of clip text features
-            avg_length = 9.
+        # class-level: original text template approach
+        if args.nlp_model == 'clip':
+            teacher, _ = clip.load("ViT-B/32", device='cuda:' + str(args.gpu))
+            text_dim = 512
+            if args.text_length != -1:
+                teacher.context_length = args.text_length
+                teacher.positional_embedding.data = teacher.positional_embedding.data[:args.text_length]
+                for layer in teacher.transformer.resblocks:
+                    layer.attn_mask.data = layer.attn_mask.data[:args.text_length, :args.text_length]
+        elif args.nlp_model == 'mpnet':
+            teacher = SentenceTransformer('all-mpnet-base-v2', device=f'cuda:{args.gpu}')
+            text_dim = 768
+        elif args.nlp_model == 'glove':
+            teacher = SentenceTransformer('average_word_embeddings_glove.6B.300d', device=f'cuda:{args.gpu}')
+            text_dim = 300
         else:
-            avg_length = (train_text ** 2).sum(-1).sqrt().mean().item()
-        train_text = F.normalize(train_text, dim=-1) * avg_length
-        test_text = F.normalize(test_text, dim=-1) * avg_length
+            raise ValueError(f'unknown nlp_model: {args.nlp_model}')
+        train_text = get_text_feature(teacher, train_dataset, args)
+        test_text = get_text_feature(teacher, test_dataset, args)
+        if args.eqnorm:
+            if args.nlp_model in ['mpnet', 'glove']:
+                avg_length = 9.
+            else:
+                avg_length = (train_text ** 2).sum(-1).sqrt().mean().item()
+            train_text = F.normalize(train_text, dim=-1) * avg_length
+            test_text = F.normalize(test_text, dim=-1) * avg_length
 
     if args.model == 'visformer-t':
         student = visformer.visformer_tiny(num_classes=num_classes)
@@ -228,9 +234,17 @@ def train(text, student, train_loader, optim, epoch, args):
         sup, que = image[:, :args.shot].contiguous(), image[:, args.shot:].contiguous()
         sup, que = sup.view(-1, *sup.shape[2:]), que.view(-1, *que.shape[2:])
 
-        glabels = glabels.view(args.train_way, args.shot+15)[:, :args.shot]
-        glabels = glabels.contiguous().view(-1)
-        text_features = text[glabels]
+        if args.use_caption:
+            # per-image: use global sample indices to look up caption features
+            indices = episode[2].cuda(args.gpu)
+            indices = indices.view(args.train_way, args.shot + 15)[:, :args.shot]
+            indices = indices.contiguous().view(-1)
+            text_features = text[indices]
+        else:
+            # per-class: use class labels
+            glabels = glabels.view(args.train_way, args.shot+15)[:, :args.shot]
+            glabels = glabels.contiguous().view(-1)
+            text_features = text[glabels]
         if args.prompt_mode == 'spatial':
             text_features = student.t2i(text_features)
             _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
@@ -273,9 +287,15 @@ def test(text, student, test_loader, epoch, args):
                 sup, que = image[:, :args.shot].contiguous(), image[:, args.shot:].contiguous()
                 sup, que = sup.view(-1, *sup.shape[2:]), que.view(-1, *que.shape[2:])
 
-                glabels = glabels.view(args.way, args.shot + 15)[:, :args.shot]
-                glabels = glabels.contiguous().view(-1)
-                text_features = text[glabels]
+                if args.use_caption:
+                    indices = episode[2].cuda(args.gpu)
+                    indices = indices.view(args.way, args.shot + 15)[:, :args.shot]
+                    indices = indices.contiguous().view(-1)
+                    text_features = text[indices]
+                else:
+                    glabels = glabels.view(args.way, args.shot + 15)[:, :args.shot]
+                    glabels = glabels.contiguous().view(-1)
+                    text_features = text[glabels]
                 if args.prompt_mode == 'spatial':
                     text_features = student.t2i(text_features)
                     _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
@@ -313,11 +333,15 @@ def test(text, student, test_loader, epoch, args):
                 sup = image[:, :, :args.shot].contiguous().view(-1, *image.shape[3:])
                 que = image[0, :, args.shot:].contiguous().view(-1, *image.shape[3:])
 
-                glabels = glabels.view(args.way, args.shot + 15)[:, :args.shot]
-                glabels = glabels.unsqueeze(0).repeat(args.aug_support, 1, 1).contiguous().view(-1)
-                text_features = text[glabels]
-                # text_features = student.t2i(text_features)
-                # _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
+                if args.use_caption:
+                    indices = episode[2].cuda(args.gpu)
+                    indices = indices.view(args.way, args.shot + 15)[:, :args.shot]
+                    indices = indices.unsqueeze(0).repeat(args.aug_support, 1, 1).contiguous().view(-1)
+                    text_features = text[indices]
+                else:
+                    glabels = glabels.view(args.way, args.shot + 15)[:, :args.shot]
+                    glabels = glabels.unsqueeze(0).repeat(args.aug_support, 1, 1).contiguous().view(-1)
+                    text_features = text[glabels]
                 if args.prompt_mode == 'spatial':
                     text_features = student.t2i(text_features)
                     _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
@@ -373,6 +397,8 @@ if __name__ == '__main__':
     parser.add_argument('--aug_support', type=int, default=1)
     parser.add_argument('--model', type=str, default='visformer-t', choices=['visformer-t', 'visformer-t-84'])
     parser.add_argument('--nlp_model', type=str, default='clip', choices=['clip', 'glove', 'mpnet'])
+    parser.add_argument('--use_caption', action='store_true',
+                        help='Use per-image LLaVA captions instead of class-level text templates')
     parser.add_argument('--prompt_mode', type=str, default='spatial+channel', choices=['spatial', 'channel', 'spatial+channel'])
     parser.add_argument('--no_template', action='store_true')
     parser.add_argument('--eqnorm', action='store_true', default=True)
