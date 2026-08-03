@@ -14,6 +14,7 @@ import clip
 from sentence_transformers import SentenceTransformer
 os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 import visformer
+from weight_init import trunc_normal_
 from data.dataloader import EpisodeSampler, MultiTrans
 from data.dataset import DatasetWithTextLabel
 from data.randaugment import RandAugmentMC
@@ -135,9 +136,13 @@ def main(args):
                                                torch.nn.Linear(feature_dim, feature_dim),
                                                torch.nn.Sigmoid(),)
 
+    # learnable blank prompt token (VPT-style) injected into query samples at args.stage
+    student.query_prompt = torch.nn.Parameter(torch.zeros(feature_dim))
+    trunc_normal_(student.query_prompt, std=0.02)
+
     student = student.cuda(args.gpu)
 
-    optim_params_id = [id(param) for param in student.t2i.parameters()]
+    optim_params_id = [id(param) for param in student.t2i.parameters()] + [id(student.query_prompt)]
     if 'channel' in args.prompt_mode:
         optim_params_id += [id(param) for param in student.t2i2.parameters()]  # se_block is not included. use smaller lr for se_block
         # optim_params_id += [id(param) for param in student.se_block.parameters()]
@@ -191,6 +196,12 @@ def main(args):
             torch.save(checkpoint, args.checkpoint_dir + f'checkpoint_epoch_best.pth')
 
 
+def forward_query(student, que, args):
+    # inject the shared learnable blank prompt token (spatial only) for query samples
+    query_prompt = student.query_prompt.unsqueeze(0).repeat(que.shape[0], 1)
+    return student.forward_with_semantic_prompt(que, query_prompt, args)
+
+
 def get_text_feature(teacher, dataset, args):
     class_idx = dataset.dataset.classes
     idx2text = dataset.idx2text
@@ -239,7 +250,7 @@ def train(text, student, train_loader, optim, epoch, args):
 
         sup_im_features = sup_im_features.view(args.train_way, args.shot, -1).mean(dim=1)
 
-        _, que_im_features = student(que)
+        _, que_im_features = forward_query(student, que, args)
 
         sim = F.normalize(que_im_features, dim=-1) @ F.normalize(sup_im_features, dim=-1).t()
         loss = F.cross_entropy(sim / args.t, labels)
@@ -281,7 +292,7 @@ def test(text, student, test_loader, epoch, args):
                     _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
                 else:
                     _, sup_im_features = student.forward_with_semantic_prompt_channel(sup, text_features, args)
-                _, que_im_features = student(que)
+                _, que_im_features = forward_query(student, que, args)
 
                 if args.test_classifier == 'prototype':
                     sup_im_features = sup_im_features.view(args.way, args.shot, -1).mean(dim=1)
@@ -324,7 +335,7 @@ def test(text, student, test_loader, epoch, args):
                 else:
                     _, sup_im_features = student.forward_with_semantic_prompt_channel(sup, text_features, args)
 
-                _, que_im_features = student(que)
+                _, que_im_features = forward_query(student, que, args)
 
                 if args.test_classifier == 'prototype':
                     sup_im_features = sup_im_features.view(args.aug_support, args.way, args.shot, -1).mean(dim=0).mean(dim=1)
