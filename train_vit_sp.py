@@ -80,8 +80,8 @@ def main(args):
     if args.use_caption:
         # instance-level: load pre-computed per-image CLIP features
         text_dim = 512
-        train_text = torch.load(f'data/captions/{args.dataset}_train_clip_features.pt')
-        test_text = torch.load(f'data/captions/{args.dataset}_{args.split}_clip_features.pt')
+        train_text = torch.load(f'data/captions/{args.dataset}_train_clip_features.pt').cuda(args.gpu)
+        test_text = torch.load(f'data/captions/{args.dataset}_{args.split}_clip_features.pt').cuda(args.gpu)
         print(f'Loaded caption features: train {train_text.shape}, test {test_text.shape}')
     else:
         # class-level: original text template approach

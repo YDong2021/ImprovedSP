@@ -15,7 +15,7 @@ from transformers import AutoProcessor, LlavaForConditionalGeneration
 
 def build_prompt(class_name: str) -> str:
     return (
-        f"Describe this image of a {class_name} in one short sentence. "
+        f"Describe this image of a {class_name} in one sentence. "
         f"Focus on the visual appearance including shape, color, texture, and distinguishing features."
     )
 
@@ -32,6 +32,15 @@ def main(args):
     dataset_dir = f'./dataset/{args.dataset_folder}/{split_map[args.split]}'
     dataset = ImageFolder(dataset_dir)
     classes = dataset.classes  # folder names
+    # For FC100, folder names are numeric CIFAR-100 indices; map to real class names
+    if args.dataset == 'FC100':
+        idx2text = {}
+        with open('data/cifar100_idx2text.txt', 'r') as f:
+            for line in f:
+                parts = line.strip().split(maxsplit=1)
+                if len(parts) == 2:
+                    idx2text[parts[0].strip(':')] = parts[1].replace('_', ' ')
+        classes = [idx2text.get(c, c) for c in classes]
     print(f'Dataset: {dataset_dir}, {len(dataset)} images, {len(classes)} classes')
 
     # load LLaVA

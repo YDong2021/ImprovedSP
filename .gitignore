@@ -9,7 +9,7 @@ dataset/
 
 # 训练日志
 tensorboard/
-log/
+logs/
 
 # 压缩包
 *.tar
