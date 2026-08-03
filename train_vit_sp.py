@@ -136,7 +136,8 @@ def main(args):
                                                torch.nn.Linear(feature_dim, feature_dim),
                                                torch.nn.Sigmoid(),)
 
-    # learnable blank prompt token (VPT-style) injected into query samples at args.stage
+    # learnable residual of the query prompt token; the per-episode base is the mean
+    # semantic token of candidate labels, added in forward_query
     student.query_prompt = torch.nn.Parameter(torch.zeros(feature_dim))
     trunc_normal_(student.query_prompt, std=0.02)
 
@@ -196,9 +197,9 @@ def main(args):
             torch.save(checkpoint, args.checkpoint_dir + f'checkpoint_epoch_best.pth')
 
 
-def forward_query(student, que, args):
-    # inject the shared learnable blank prompt token (spatial only) for query samples
-    query_prompt = student.query_prompt.unsqueeze(0).repeat(que.shape[0], 1)
+def forward_query(student, que, args, prompt_base):
+    # query prompt = episode-mean semantic token base + learnable residual (spatial only)
+    query_prompt = student.query_prompt.unsqueeze(0).repeat(que.shape[0], 1) + prompt_base.unsqueeze(0)
     return student.forward_with_semantic_prompt(que, query_prompt, args)
 
 
@@ -240,8 +241,11 @@ def train(text, student, train_loader, optim, epoch, args):
         sup, que = sup.view(-1, *sup.shape[2:]), que.view(-1, *que.shape[2:])
 
         glabels = glabels.view(args.train_way, args.shot+15)[:, :args.shot]
+        class_labels = glabels[:, 0]
         glabels = glabels.contiguous().view(-1)
         text_features = text[glabels]
+        # mean semantic token of candidate labels in this episode, as the query prompt base
+        prompt_base = student.t2i(text[class_labels]).mean(dim=0)
         if args.prompt_mode == 'spatial':
             text_features = student.t2i(text_features)
             _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
@@ -250,7 +254,7 @@ def train(text, student, train_loader, optim, epoch, args):
 
         sup_im_features = sup_im_features.view(args.train_way, args.shot, -1).mean(dim=1)
 
-        _, que_im_features = forward_query(student, que, args)
+        _, que_im_features = forward_query(student, que, args, prompt_base)
 
         sim = F.normalize(que_im_features, dim=-1) @ F.normalize(sup_im_features, dim=-1).t()
         loss = F.cross_entropy(sim / args.t, labels)
@@ -285,6 +289,7 @@ def test(text, student, test_loader, epoch, args):
                 sup, que = sup.view(-1, *sup.shape[2:]), que.view(-1, *que.shape[2:])
 
                 glabels = glabels.view(args.way, args.shot + 15)[:, :args.shot]
+                class_labels = glabels[:, 0]
                 glabels = glabels.contiguous().view(-1)
                 text_features = text[glabels]
                 if args.prompt_mode == 'spatial':
@@ -292,7 +297,8 @@ def test(text, student, test_loader, epoch, args):
                     _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
                 else:
                     _, sup_im_features = student.forward_with_semantic_prompt_channel(sup, text_features, args)
-                _, que_im_features = forward_query(student, que, args)
+                prompt_base = student.t2i(text[class_labels]).mean(dim=0)
+                _, que_im_features = forward_query(student, que, args, prompt_base)
 
                 if args.test_classifier == 'prototype':
                     sup_im_features = sup_im_features.view(args.way, args.shot, -1).mean(dim=1)
@@ -325,6 +331,7 @@ def test(text, student, test_loader, epoch, args):
                 que = image[0, :, args.shot:].contiguous().view(-1, *image.shape[3:])
 
                 glabels = glabels.view(args.way, args.shot + 15)[:, :args.shot]
+                class_labels = glabels[:, 0]
                 glabels = glabels.unsqueeze(0).repeat(args.aug_support, 1, 1).contiguous().view(-1)
                 text_features = text[glabels]
                 # text_features = student.t2i(text_features)
@@ -335,7 +342,8 @@ def test(text, student, test_loader, epoch, args):
                 else:
                     _, sup_im_features = student.forward_with_semantic_prompt_channel(sup, text_features, args)
 
-                _, que_im_features = forward_query(student, que, args)
+                prompt_base = student.t2i(text[class_labels]).mean(dim=0)
+                _, que_im_features = forward_query(student, que, args, prompt_base)
 
                 if args.test_classifier == 'prototype':
                     sup_im_features = sup_im_features.view(args.aug_support, args.way, args.shot, -1).mean(dim=0).mean(dim=1)
