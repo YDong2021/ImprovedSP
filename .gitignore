@@ -7,8 +7,9 @@ checkpoint/
 # 数据集图片（几万张，476M；属公开数据，不入库）
 dataset/
 
-# TensorBoard 训练日志
+# 训练日志
 tensorboard/
+logs/
 
 # 压缩包
 *.tar
@@ -25,6 +26,7 @@ __pycache__/
 # ===== IDE / 编辑器 =====
 .idea/
 .vscode/
+.qoder/
 
 # ===== 系统文件 =====
 .DS_Store
