@@ -1,13 +1,18 @@
-# 1.1
+## 设计说明
 
-原始semantic prompt
+重构注入层选择为单次前向的层内决策网络（LayerSelectNet），替换需要两次前向的 router + val 集双层优化方案：
 
-# 1.2 
+- 决策网络共享主干（当层 GAP 视觉特征 + 文本特征），4 个独立层头各输出一个决策 logit
+- 顺序决策：每层注入前 sigmoid(logit) > 0.5 即注入并终止；前三层都拒绝时第四层兜底强制注入，结构上保证每个样本恰好一层被注入
+- STE 直通：前向硬阈值、反向传 sigmoid 梯度，可微且训练/测试逻辑完全一致
+- 热启动：层 0/1 偏置 -2、层 2 偏置 +2，初始等价于固定注入 3.2 层
+- 删除 router、val 双层优化、gumbel tau、balance/entropy 正则及相关参数；启动标志 `--prompt_layer selective`
 
-改动训练时的报错
+关键性质
+要求	实现
+单次前向	决策与注入在同一前向内顺序完成
+恰好一层为"是"	顺序"首个过阈值即停" + 第 4 层兜底，构造性保证
+可微	STE：前向硬阈值，梯度经 sigmoid 回传到决策头、t2i/se_block、backbone
+训练/测试一致	两端同一套硬阈值逻辑，无 Gumbel 采样
 
-[add_disable_beta_transforms_warning](https://github.com/YDong2021/ImprovedSP/commit/d046e32e9f0abe8eb0eea198b10e410dcd9fca2e)
-
-## 1.2.1.1
-
-动态选择插入层机制。实现方式是我本人的：比较有prompt注入与无prompt注入时的差异，选差异最大的一层为最终注入层。硬截断，不可微。
+一个训练时的观察点：若日志中 fallback 比例持续偏高，说明前三层决策头都过于保守（全部 p<0.5），此时可考虑调小 --decision_warm_bias 之外的干预手段；正常情况下应从初始的层 2 主导逐步演化出分层选择。
