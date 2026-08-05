@@ -143,16 +143,20 @@ def main(args):
 
     student = student.cuda(args.gpu)
 
-    optim_params_id = [id(param) for param in student.t2i.parameters()] + [id(student.query_prompt)]
+    optim_params_id = [id(param) for param in student.t2i.parameters()]
     if 'channel' in args.prompt_mode:
         optim_params_id += [id(param) for param in student.t2i2.parameters()]  # se_block is not included. use smaller lr for se_block
         # optim_params_id += [id(param) for param in student.se_block.parameters()]
     optim_params = [param for param in student.parameters() if id(param) in optim_params_id]
-    other_params = [param for param in student.parameters() if id(param) not in optim_params_id]
+    other_params = [param for param in student.parameters() if id(param) not in optim_params_id + [id(student.query_prompt)]]
     if args.optim == 'sgd':
         optim = torch.optim.SGD(student.parameters(), lr=args.lr, momentum=0.9)
     elif args.optim == 'adamw':
+        # the query prompt residual gets its own group: higher lr to let it actually steer the
+        # query extraction, and no weight decay (wd=5e-2 would keep it collapsed near zero,
+        # drowned by the episode-mean base token)
         optim = torch.optim.AdamW([{'params': optim_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
+                                   {'params': [student.query_prompt], 'lr': args.query_lr, 'weight_decay': args.query_wd},
                                    {'params': other_params, 'lr': args.encoder_lr}], weight_decay=5e-2)
     else:
         raise ValueError(f'unknown optim: {args.optim}')
@@ -171,6 +175,12 @@ def main(args):
         student.load_state_dict(checkpoint['state_dict'])
         optim.load_state_dict(checkpoint['optimizer'])
         start_epoch = checkpoint['epoch']
+        # load_state_dict restores the saved per-group lr/wd; re-apply the CLI values for the
+        # query prompt group so its dynamics can be retuned when resuming (group order:
+        # [projectors, query_prompt, backbone])
+        if args.optim == 'adamw':
+            optim.param_groups[1]['lr'] = args.query_lr
+            optim.param_groups[1]['weight_decay'] = args.query_wd
         print(f'load checkpoint at epoch {start_epoch}')
 
     if args.test:
@@ -198,8 +208,12 @@ def main(args):
 
 
 def forward_query(student, que, args, prompt_base):
-    # query prompt = episode-mean semantic token base + learnable residual (spatial only)
-    query_prompt = student.query_prompt.unsqueeze(0).repeat(que.shape[0], 1) + prompt_base.unsqueeze(0)
+    # query prompt = episode-mean semantic token base + learnable residual (spatial only).
+    # the raw episode mean keeps a norm comparable to a single-class prompt (~9 in text space)
+    # and would drown the learnable residual, so its direction is kept but its norm is rescaled
+    # to args.prompt_base_norm, letting the residual actually steer the query feature extraction
+    base = F.normalize(prompt_base, dim=-1) * args.prompt_base_norm
+    query_prompt = student.query_prompt.unsqueeze(0).repeat(que.shape[0], 1) + base.unsqueeze(0)
     return student.forward_with_semantic_prompt(que, query_prompt, args)
 
 
@@ -271,6 +285,11 @@ def train(text, student, train_loader, optim, epoch, args):
             print(print_string)
     args.logger.add_scalar('train/loss', losses / len(train_loader), epoch)
     args.logger.add_scalar('train/acc', accs / len(train_loader), epoch)
+    # monitor the learnable residual: it must grow steadily, otherwise the query prompt is
+    # effectively frozen at the episode-mean base and cannot adapt
+    qp_norm = student.query_prompt.norm().item()
+    args.logger.add_scalar('train/query_prompt_norm', qp_norm, epoch)
+    print(f'Train epoch: {epoch}, query_prompt norm: {qp_norm:.4f}')
 
 
 def test(text, student, test_loader, epoch, args):
@@ -401,6 +420,9 @@ if __name__ == '__main__':
     parser.add_argument('--t', type=float, default=0.2)
     parser.add_argument('--optim', type=str, default='adamw', choices=['sgd', 'adamw'])
     parser.add_argument('--lr', type=float, default=5e-4)
+    parser.add_argument('--query_lr', type=float, default=2e-3)
+    parser.add_argument('--query_wd', type=float, default=0.)
+    parser.add_argument('--prompt_base_norm', type=float, default=2.0)
     parser.add_argument('--weight_decay', type=float, default=5e-2)
     parser.add_argument('--encoder_lr', type=float, default=1e-6)
     parser.add_argument('--init', type=str, default='checkpoint/miniImageNet/visformer-t/pre-train/checkpoint_epoch_800.pth')
