@@ -32,10 +32,14 @@ class LayerSelectNet(nn.Module):
         self.text_fc = nn.Linear(text_dim, hidden)
         self.act = nn.ReLU(inplace=True)
         self.heads = nn.ModuleList([nn.Linear(hidden * 2, 1) for _ in range(num_layers)])
-        # warm start: p0, p1 < 0.5 and p2 > 0.5, so the initial hard decision injects layer 2
+        # warm start: zero the head weights so the initial logit equals the bias for every
+        # input (random head weights would amplify the trunk activations and drown the bias,
+        # making the warm start nominal). a tiny noise breaks the exact zero-weight symmetry.
+        # p0, p1 < 0.5 and p2 > 0.5, so the initial hard decision injects layer 2
         # (the known-best fixed layer 3.2) for every sample
         with torch.no_grad():
             for l, head in enumerate(self.heads):
+                head.weight.mul_(1e-3)
                 head.bias.fill_(-warm_bias)
             self.heads[2].bias.fill_(warm_bias)
 
@@ -173,17 +177,21 @@ def main(args):
         optim_params_id += [id(param) for param in student.t2i2.parameters()]  # se_block is not included. use smaller lr for se_block
         # optim_params_id += [id(param) for param in student.se_block.parameters()]
     optim_params = [param for param in student.parameters() if id(param) in optim_params_id]
-    if decision_net is not None:
-        # the decision net is a newly added module like t2i, so it trains with the high lr
-        optim_params += list(decision_net.parameters())
     other_params = [param for param in student.parameters()
                     if id(param) not in optim_params_id]
     if args.optim == 'sgd':
         all_params = list(student.parameters()) + (list(decision_net.parameters()) if decision_net is not None else [])
         optim = torch.optim.SGD(all_params, lr=args.lr, momentum=0.9)
     elif args.optim == 'adamw':
-        param_groups = [{'params': optim_params, 'lr': args.lr, 'weight_decay': args.weight_decay},
-                        {'params': other_params, 'lr': args.encoder_lr}]
+        param_groups = [{'params': optim_params, 'lr': args.lr, 'weight_decay': args.weight_decay}]
+        if decision_net is not None:
+            # the decision net gets its own group with a reduced lr: a fast head would race
+            # ahead of the backbone and collapse the selection onto one layer before the
+            # backbone has adapted to multi-layer injection
+            param_groups.append({'params': list(decision_net.parameters()),
+                                 'lr': args.lr * args.decision_lr_mult,
+                                 'weight_decay': args.weight_decay})
+        param_groups.append({'params': other_params, 'lr': args.encoder_lr})
         optim = torch.optim.AdamW(param_groups, weight_decay=5e-2)
     else:
         raise ValueError(f'unknown optim: {args.optim}')
@@ -260,6 +268,16 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
     student.train()
     if decision_net is not None:
         decision_net.train()
+        # decision warmup: freeze the heads for the first epochs so the backbone and the
+        # projectors first adapt to the warm-start injection (layer 2, i.e. fixed 3.2);
+        # otherwise the heads race ahead and collapse the selection onto one layer.
+        # requires_grad (not lr=0) is needed because AdamW still moves zero-grad params
+        # through weight decay
+        frozen = epoch < args.decision_warmup_epochs
+        for p in decision_net.parameters():
+            p.requires_grad_(not frozen)
+        if epoch == 0 or epoch == args.decision_warmup_epochs:
+            print(f'decision heads {"frozen (warmup)" if frozen else "unfrozen"} at epoch {epoch}')
     losses = 0.
     accs = 0.
     num_layers = len(student.stage3)
@@ -277,7 +295,7 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
         glabels = glabels.contiguous().view(-1)
         text_features = text[glabels]
         if args.prompt_layer == 'selective':
-            _, sup_im_features, selection = student.forward_with_selective_prompt(sup, text_features, decision_net, args)
+            _, sup_im_features, selection, p_hist = student.forward_with_selective_prompt(sup, text_features, decision_net, args)
             # selection histogram: how often each stage3 layer ends up being the injection layer.
             # a high share of the last layer means the fallback keeps firing, i.e. the first
             # three decision heads are all too conservative
@@ -294,6 +312,13 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
 
         sim = F.normalize(que_im_features, dim=-1) @ F.normalize(sup_im_features, dim=-1).t()
         loss = F.cross_entropy(sim / args.t, labels)
+        if args.prompt_layer == 'selective':
+            # batch-level load balancing: the STE classification signal alone rewards early
+            # injection and collapses the selection onto one layer; maximizing the entropy of
+            # the mean per-layer activation keeps all layers in use
+            q = p_hist.mean(dim=1)
+            entropy = -(q * (q + 1e-6).log()).sum()
+            loss = loss - args.select_entropy_w * entropy
         losses += loss.item()
         _, pred = sim.max(-1)
         accs += labels.eq(pred).sum().float().item() / labels.shape[0]
@@ -336,7 +361,7 @@ def test(text, student, decision_net, test_loader, epoch, args):
                 glabels = glabels.contiguous().view(-1)
                 text_features = text[glabels]
                 if args.prompt_layer == 'selective':
-                    _, sup_im_features, _ = student.forward_with_selective_prompt(sup, text_features, decision_net, args)
+                    _, sup_im_features, _, _ = student.forward_with_selective_prompt(sup, text_features, decision_net, args)
                 elif args.prompt_mode == 'spatial':
                     text_features = student.t2i(text_features)
                     _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
@@ -380,7 +405,7 @@ def test(text, student, decision_net, test_loader, epoch, args):
                 # text_features = student.t2i(text_features)
                 # _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
                 if args.prompt_layer == 'selective':
-                    _, sup_im_features, _ = student.forward_with_selective_prompt(sup, text_features, decision_net, args)
+                    _, sup_im_features, _, _ = student.forward_with_selective_prompt(sup, text_features, decision_net, args)
                 elif args.prompt_mode == 'spatial':
                     text_features = student.t2i(text_features)
                     _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
@@ -439,6 +464,9 @@ if __name__ == '__main__':
     parser.add_argument('--prompt_mode', type=str, default='spatial+channel', choices=['spatial', 'channel', 'spatial+channel'])
     parser.add_argument('--prompt_layer', type=str, default='fixed', choices=['fixed', 'selective'])
     parser.add_argument('--decision_warm_bias', type=float, default=2.)
+    parser.add_argument('--decision_lr_mult', type=float, default=0.02)
+    parser.add_argument('--decision_warmup_epochs', type=int, default=10)
+    parser.add_argument('--select_entropy_w', type=float, default=0.1)
     parser.add_argument('--no_template', action='store_true')
     parser.add_argument('--eqnorm', action='store_true', default=True)
     parser.add_argument('--stage', type=float, default=3.2, choices=[2, 2.1, 2.2, 2.3, 3, 3.1, 3.2, 3.3])

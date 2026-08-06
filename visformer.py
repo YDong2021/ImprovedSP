@@ -557,12 +557,16 @@ class Visformer(nn.Module):
             x = torch.cat([x, torch.zeros(B, C, 1, W, dtype=x.dtype, device=x.device)], dim=2)
         injected = torch.zeros(B, dtype=torch.bool)
         selection = torch.full((B,), num_layers - 1, dtype=torch.long)
+        p_hist = []
         for l, b in enumerate(self.stage3):
             active = (~injected).to(x.device)
+            # logits are computed for every sample at every layer (not only the still-active
+            # ones) so the batch-level entropy regularizer gets a signal for all heads
+            v = x[:, :, :H].reshape(B, C, -1).mean(-1)
+            logit = decision_net(v, semantic_prompt, l)
+            p = torch.sigmoid(logit)
+            p_hist.append(p)
             if active.any():
-                v = x[:, :, :H].reshape(B, C, -1).mean(-1)
-                logit = decision_net(v, semantic_prompt, l)
-                p = torch.sigmoid(logit)
                 if l < num_layers - 1:
                     d = (p > 0.5).float()
                     # STE: forward value is the hard decision, backward gradient is sigmoid'(logit)
@@ -602,7 +606,7 @@ class Visformer(nn.Module):
             x = x[:, :, 0, 0]
 
         logit = self.head( x.view(x.size(0), -1) )
-        return logit, x.squeeze(), selection
+        return logit, x.squeeze(), selection, torch.stack(p_hist)
 
 
 def visformer_tiny(**kwargs):
