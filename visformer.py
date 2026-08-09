@@ -429,9 +429,10 @@ class Visformer(nn.Module):
         logit = self.head( x.view(x.size(0), -1) )
         return logit, x.squeeze()
 
-    def forward_with_semantic_prompt_channel(self, x, semantic_prompt, args):
+    def forward_with_semantic_prompt_channel(self, x, semantic_prompt, args, prompt1=None):
         if 'spatial' in args.prompt_mode:
-            prompt1 = self.t2i(semantic_prompt)
+            if prompt1 is None:
+                prompt1 = self.t2i(semantic_prompt)
         if 'channel' in args.prompt_mode:
             prompt2 = self.t2i2(semantic_prompt)
 

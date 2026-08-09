@@ -127,6 +127,10 @@ def main(args):
                                           torch.nn.Linear(text_dim, text_dim),
                                           torch.nn.ReLU(),
                                           torch.nn.Linear(text_dim, feature_dim, bias=False))
+    elif args.projector == 'bottleneck':
+        student.t2i = torch.nn.Sequential(torch.nn.Linear(text_dim, args.bottleneck_dim),
+                                          torch.nn.GELU(),
+                                          torch.nn.Linear(args.bottleneck_dim, feature_dim, bias=False))
 
     if 'channel' in args.prompt_mode:
         student.t2i2 = torch.nn.Linear(text_dim, feature_dim, bias=False)
@@ -218,7 +222,10 @@ def get_text_feature(teacher, dataset, args):
 def train(text, student, train_loader, optim, epoch, args):
     student.train()
     losses = 0.
+    align_losses = 0.
+    preserve_losses = 0.
     accs = 0.
+    align_labels = torch.arange(args.train_way).cuda(args.gpu)
     for idx, episode in enumerate(train_loader):
         image = episode[0].cuda(args.gpu)  # way * (shot+15)
         glabels = episode[1].cuda(args.gpu)
@@ -231,18 +238,36 @@ def train(text, student, train_loader, optim, epoch, args):
         glabels = glabels.view(args.train_way, args.shot+15)[:, :args.shot]
         glabels = glabels.contiguous().view(-1)
         text_features = text[glabels]
+        prompt_feats = student.t2i(text_features)
         if args.prompt_mode == 'spatial':
-            text_features = student.t2i(text_features)
-            _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
+            _, sup_im_features = student.forward_with_semantic_prompt(sup, prompt_feats, args)
         else:
-            _, sup_im_features = student.forward_with_semantic_prompt_channel(sup, text_features, args)
+            _, sup_im_features = student.forward_with_semantic_prompt_channel(sup, text_features, args,
+                                                                              prompt1=prompt_feats)
 
-        sup_im_features = sup_im_features.view(args.train_way, args.shot, -1).mean(dim=1)
+        sup_protos = sup_im_features.view(args.train_way, args.shot, -1).mean(dim=1)
 
         _, que_im_features = student(que)
 
-        sim = F.normalize(que_im_features, dim=-1) @ F.normalize(sup_im_features, dim=-1).t()
+        sim = F.normalize(que_im_features, dim=-1) @ F.normalize(sup_protos, dim=-1).t()
         loss = F.cross_entropy(sim / args.t, labels)
+
+        # modality alignment: pull class prompt embeddings toward their visual prototypes (InfoNCE)
+        if args.align_weight > 0:
+            prompt_protos = prompt_feats.view(args.train_way, args.shot, -1).mean(dim=1)
+            align_sim = F.normalize(prompt_protos, dim=-1) @ F.normalize(sup_protos, dim=-1).t()
+            align_loss = F.cross_entropy(align_sim / args.t, align_labels)
+            loss = loss + args.align_weight * align_loss
+            align_losses += align_loss.item()
+
+        # feature preservation: keep prompt-injected support features close to clean backbone features
+        if args.preserve_weight > 0:
+            with torch.no_grad():
+                _, sup_clean_features = student(sup)
+            preserve_loss = (1 - F.cosine_similarity(sup_im_features, sup_clean_features, dim=-1)).mean()
+            loss = loss + args.preserve_weight * preserve_loss
+            preserve_losses += preserve_loss.item()
+
         losses += loss.item()
         _, pred = sim.max(-1)
         accs += labels.eq(pred).sum().float().item() / labels.shape[0]
@@ -256,6 +281,10 @@ def train(text, student, train_loader, optim, epoch, args):
             print(print_string)
     args.logger.add_scalar('train/loss', losses / len(train_loader), epoch)
     args.logger.add_scalar('train/acc', accs / len(train_loader), epoch)
+    if args.align_weight > 0:
+        args.logger.add_scalar('train/align_loss', align_losses / len(train_loader), epoch)
+    if args.preserve_weight > 0:
+        args.logger.add_scalar('train/preserve_loss', preserve_losses / len(train_loader), epoch)
 
 
 def test(text, student, test_loader, epoch, args):
@@ -377,7 +406,10 @@ if __name__ == '__main__':
     parser.add_argument('--no_template', action='store_true')
     parser.add_argument('--eqnorm', action='store_true', default=True)
     parser.add_argument('--stage', type=float, default=3.2, choices=[2, 2.1, 2.2, 2.3, 3, 3.1, 3.2, 3.3])
-    parser.add_argument('--projector', type=str, default='linear', choices=['linear', 'mlp', 'mlp3'])
+    parser.add_argument('--projector', type=str, default='linear', choices=['linear', 'mlp', 'mlp3', 'bottleneck'])
+    parser.add_argument('--bottleneck_dim', type=int, default=64)
+    parser.add_argument('--align_weight', type=float, default=0.1)
+    parser.add_argument('--preserve_weight', type=float, default=0.1)
     parser.add_argument('--avg', type=str, default='all', choices=['all', 'patch', 'head'])
     parser.add_argument('--t', type=float, default=0.2)
     parser.add_argument('--optim', type=str, default='adamw', choices=['sgd', 'adamw'])
