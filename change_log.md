@@ -7,7 +7,8 @@
 - STE 直通：前向硬阈值、反向传 sigmoid 梯度，可微且训练/测试逻辑完全一致
 - 热启动：层 0/1 偏置 -2、层 2 偏置 +2，初始等价于固定注入 3.2 层
 - 删除 router、val 双层优化、gumbel tau 及相关参数；启动标志 `--prompt_layer selective`
-- 决策辅助损失（训练循环内由前向返回的 p_hist 推导，前向无需额外导出）：B 决策锐化（--decision_entropy）：对实际到达的决策点加二值熵惩罚，把 p 推离 0.5 不稳定区、抑制决策翻转；C 负载均衡（--balance_reg）：对批内软停时边际分布（Σw=1，可微）做熵最大化并随训练衰减，防坍缩到热启动层、保持未选中路径可训，替代原 select_entropy 项
+- 决策辅助损失：批级均值激活熵（--select_entropy_w，selective 与 multi 共用）防选择/门控坍缩到单层
+- multi 模式（`--prompt_layer multi`）：四层软门控注入，w_l=sigmoid(logit_l)，四层皆注入、程度随样本自适应，完全可微（无 STE/兜底/恰好一层约束）；spatial 复用单预留行每层加性刷新，channel 广播加；四层共享 t2i/t2i2 投影；辅助损失仅沿用 select_entropy（作用于门控均值）；监控为每层 gate 均值（train/gate_l{l}）
 
 关键性质
 要求	实现

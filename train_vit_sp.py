@@ -164,7 +164,7 @@ def main(args):
                                                torch.nn.Sigmoid(),)
 
     decision_net = None
-    if args.prompt_layer == 'selective':
+    if args.prompt_layer in ('selective', 'multi'):
         decision_net = LayerSelectNet(feature_dim, text_dim, len(student.stage3),
                                       warm_bias=args.decision_warm_bias)
 
@@ -282,7 +282,7 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
     accs = 0.
     num_layers = len(student.stage3)
     select_hist = torch.zeros(num_layers)
-    sharp_stat, marg_stat = 0., 0.
+    gate_sum = torch.zeros(num_layers)
     for idx, episode in enumerate(train_loader):
         image = episode[0].cuda(args.gpu)  # way * (shot+15)
         glabels = episode[1].cuda(args.gpu)
@@ -301,6 +301,12 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
             # a high share of the last layer means the fallback keeps firing, i.e. the first
             # three decision heads are all too conservative
             select_hist = select_hist + torch.bincount(selection, minlength=num_layers).float()
+        elif args.prompt_layer == 'multi':
+            _, sup_im_features, p_hist = student.forward_with_multi_prompt(sup, text_features, decision_net, args)
+            # per-layer mean gate: watch the soft injection strength drift from the warm start
+            # [~.12, ~.12, ~.88, ~.12]; all gates saturating to ~1 means multi collapsed into
+            # fixed full injection
+            gate_sum = gate_sum + p_hist.detach().cpu().mean(dim=1)
         elif args.prompt_mode == 'spatial':
             text_features = student.t2i(text_features)
             _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
@@ -313,39 +319,13 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
 
         sim = F.normalize(que_im_features, dim=-1) @ F.normalize(sup_im_features, dim=-1).t()
         loss = F.cross_entropy(sim / args.t, labels)
-        if args.prompt_layer == 'selective':
-            # B: decision sharpening. binary entropy penalty on every decision point actually
-            # reached (the active mask is chained from the detached hard decisions), pushing
-            # each sigmoid away from the 0.5 flip zone so the hard decision stops flipping and
-            # the STE stays valid. the forced fallback head is excluded, it makes no decision
-            if args.decision_entropy > 0:
-                sharp = 0.
-                active = torch.ones_like(p_hist[0])
-                for l in range(num_layers - 1):
-                    p = p_hist[l]
-                    bp = -(p * p.clamp_min(1e-6).log() + (1 - p) * (1 - p).clamp_min(1e-6).log())
-                    sharp = sharp + (bp * active).sum() / active.sum().clamp_min(1)
-                    active = active * (p.detach() <= 0.5).float()
-                loss = loss + args.decision_entropy * sharp
-                sharp_stat += sharp.item()
-            # C: load balancing. the soft stop-time distribution w (per sample sum_l w_l = 1,
-            # fully differentiable) is derived from p_hist; maximizing the batch marginal
-            # entropy keeps every layer's hard injection path in use so unselected paths do
-            # not rot. decayed to 0 so the selection may settle on a non-uniform distribution
-            # later. supersedes the plain mean-activation entropy term
-            if args.balance_reg > 0:
-                progress = epoch / max(args.epochs - 1, 1)
-                q = torch.ones_like(p_hist[0])
-                soft_w = []
-                for l in range(num_layers - 1):
-                    p = p_hist[l]
-                    soft_w.append(q * p)
-                    q = q * (1 - p)
-                soft_w.append(q)
-                w_mean = torch.stack(soft_w, dim=-1).mean(0)
-                marginal_entropy = -(w_mean * w_mean.clamp_min(1e-9).log()).sum()
-                loss = loss - args.balance_reg * (1 - progress) * marginal_entropy
-                marg_stat += marginal_entropy.item()
+        if args.prompt_layer in ('selective', 'multi'):
+            # batch-level load balancing: the classification signal alone rewards concentrating
+            # the injection onto one layer (or saturating the soft gates); maximizing the entropy
+            # of the mean per-layer activation keeps all layers in use
+            q = p_hist.mean(dim=1)
+            entropy = -(q * (q + 1e-6).log()).sum()
+            loss = loss - args.select_entropy_w * entropy
         losses += loss.item()
         _, pred = sim.max(-1)
         accs += labels.eq(pred).sum().float().item() / labels.shape[0]
@@ -365,10 +345,11 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
               f'| fallback: {select_freq[-1]:.3f}')
         for l in range(num_layers):
             args.logger.add_scalar(f'train/select_l{l}', select_freq[l].item(), epoch)
-        if args.decision_entropy > 0:
-            args.logger.add_scalar('train/decision_sharpness', sharp_stat / len(train_loader), epoch)
-        if args.balance_reg > 0:
-            args.logger.add_scalar('train/balance_entropy', marg_stat / len(train_loader), epoch)
+    elif args.prompt_layer == 'multi':
+        gate_mean = gate_sum / len(train_loader)
+        print('gate mean:', [f'{g:.3f}' for g in gate_mean.tolist()])
+        for l in range(num_layers):
+            args.logger.add_scalar(f'train/gate_l{l}', gate_mean[l].item(), epoch)
 
 
 def test(text, student, decision_net, test_loader, epoch, args):
@@ -393,6 +374,8 @@ def test(text, student, decision_net, test_loader, epoch, args):
                 text_features = text[glabels]
                 if args.prompt_layer == 'selective':
                     _, sup_im_features, _, _ = student.forward_with_selective_prompt(sup, text_features, decision_net, args)
+                elif args.prompt_layer == 'multi':
+                    _, sup_im_features, _ = student.forward_with_multi_prompt(sup, text_features, decision_net, args)
                 elif args.prompt_mode == 'spatial':
                     text_features = student.t2i(text_features)
                     _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
@@ -437,6 +420,8 @@ def test(text, student, decision_net, test_loader, epoch, args):
                 # _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
                 if args.prompt_layer == 'selective':
                     _, sup_im_features, _, _ = student.forward_with_selective_prompt(sup, text_features, decision_net, args)
+                elif args.prompt_layer == 'multi':
+                    _, sup_im_features, _ = student.forward_with_multi_prompt(sup, text_features, decision_net, args)
                 elif args.prompt_mode == 'spatial':
                     text_features = student.t2i(text_features)
                     _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
@@ -493,12 +478,11 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='visformer-t', choices=['visformer-t', 'visformer-t-84'])
     parser.add_argument('--nlp_model', type=str, default='clip', choices=['clip', 'glove', 'mpnet'])
     parser.add_argument('--prompt_mode', type=str, default='spatial+channel', choices=['spatial', 'channel', 'spatial+channel'])
-    parser.add_argument('--prompt_layer', type=str, default='fixed', choices=['fixed', 'selective'])
+    parser.add_argument('--prompt_layer', type=str, default='fixed', choices=['fixed', 'selective', 'multi'])
     parser.add_argument('--decision_warm_bias', type=float, default=2.)
     parser.add_argument('--decision_lr_mult', type=float, default=0.02)
     parser.add_argument('--decision_warmup_epochs', type=int, default=10)
-    parser.add_argument('--decision_entropy', type=float, default=0.01)
-    parser.add_argument('--balance_reg', type=float, default=0.01)
+    parser.add_argument('--select_entropy_w', type=float, default=0.1)
     parser.add_argument('--no_template', action='store_true')
     parser.add_argument('--eqnorm', action='store_true', default=True)
     parser.add_argument('--stage', type=float, default=3.2, choices=[2, 2.1, 2.2, 2.3, 3, 3.1, 3.2, 3.3])

@@ -608,6 +608,83 @@ class Visformer(nn.Module):
         logit = self.head( x.view(x.size(0), -1) )
         return logit, x.squeeze(), selection, torch.stack(p_hist)
 
+    # multi-layer gated prompt injection: every stage3 block receives the shared prompt scaled
+    # by its own soft gate w_l = sigmoid(logit_l), so all four layers are injected with
+    # sample-dependent strength. no STE / fallback / exactly-one constraint is needed: the gates
+    # are continuous and the whole path is differentiable, train and test are trivially identical
+    def forward_with_multi_prompt(self, x, semantic_prompt, decision_net, args):
+        if 'spatial' in args.prompt_mode:
+            prompt1 = self.t2i(semantic_prompt)
+        if 'channel' in args.prompt_mode:
+            prompt2 = self.t2i2(semantic_prompt)
+
+        if self.using_stem:
+            x = self.stem(x)
+
+        # stage 1
+        x = self.patch_embed1(x)
+        if self.pos_embed:
+            x = x + self.pos_embed1
+            x = self.pos_drop(x)
+        for b in self.stage1:
+            x = b(x)
+
+        # stage 2 (no injection)
+        if not self.vit_embedding:
+            x = self.patch_embed2(x)
+            if self.pos_embed:
+                x = x + self.pos_embed2
+                x = self.pos_drop(x)
+        for b in self.stage2:
+            x = b(x)
+
+        # stage3
+        if not self.vit_embedding:
+            x = self.patch_embed3(x)
+            if self.pos_embed:
+                x = x + self.pos_embed3
+                x = self.pos_drop(x)
+        B, C, H, W = x.shape
+        if 'spatial' in args.prompt_mode:
+            # persistent prompt row, kept until pooling. the sequence stays (H+1) x W so the
+            # H != W attention hack and the pooling logic work unchanged
+            x = torch.cat([x, torch.zeros(B, C, 1, W, dtype=x.dtype, device=x.device)], dim=2)
+        g_hist = []
+        for l, b in enumerate(self.stage3):
+            v = x[:, :, :H].reshape(B, C, -1).mean(-1)
+            w = torch.sigmoid(decision_net(v, semantic_prompt, l))
+            g_hist.append(w)
+            gate = w.view(B, 1, 1, 1)
+            if 'channel' in args.prompt_mode:
+                context = x[:, :, :H].reshape(B, C, -1).mean(-1)
+                context = torch.cat([context, prompt2], dim=-1)
+                context = self.se_block(context)
+                context = context - context.mean(dim=-1, keepdim=True)
+                x = torch.cat([x[:, :, :H] + gate * context.view(B, C, 1, 1), x[:, :, H:]], dim=2)
+            if 'spatial' in args.prompt_mode:
+                # additive refresh of the same reserved row each layer
+                x = torch.cat([x[:, :, :H], x[:, :, H:] + gate * prompt1.view(B, C, 1, 1)], dim=2)
+            x = b(x)
+
+        # head
+        x = self.norm(x)
+        if self.pool:
+            if 'spatial' not in args.prompt_mode:
+                x = self.global_pooling(x)
+            else:
+                B, C, H, W = x.shape
+                if args.avg == 'all':
+                    x = x.view(B, C, -1)[:, :, :(H - 1) * W + 1].mean(-1)
+                elif args.avg == 'patch':
+                    x = x.view(B, C, -1)[:, :, :(H - 1) * W].mean(-1)
+                elif args.avg == 'head':
+                    x = x.view(B, C, -1)[:, :, -1]
+        else:
+            x = x[:, :, 0, 0]
+
+        logit = self.head( x.view(x.size(0), -1) )
+        return logit, x.squeeze(), torch.stack(g_hist)
+
 
 def visformer_tiny(**kwargs):
     model = Visformer(img_size=224, init_channels=16, embed_dim=192, depth=[7,4,4], num_heads=3, mlp_ratio=4., group=8,
