@@ -282,6 +282,7 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
     accs = 0.
     num_layers = len(student.stage3)
     select_hist = torch.zeros(num_layers)
+    sharp_stat, marg_stat = 0., 0.
     for idx, episode in enumerate(train_loader):
         image = episode[0].cuda(args.gpu)  # way * (shot+15)
         glabels = episode[1].cuda(args.gpu)
@@ -313,12 +314,38 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
         sim = F.normalize(que_im_features, dim=-1) @ F.normalize(sup_im_features, dim=-1).t()
         loss = F.cross_entropy(sim / args.t, labels)
         if args.prompt_layer == 'selective':
-            # batch-level load balancing: the STE classification signal alone rewards early
-            # injection and collapses the selection onto one layer; maximizing the entropy of
-            # the mean per-layer activation keeps all layers in use
-            q = p_hist.mean(dim=1)
-            entropy = -(q * (q + 1e-6).log()).sum()
-            loss = loss - args.select_entropy_w * entropy
+            # B: decision sharpening. binary entropy penalty on every decision point actually
+            # reached (the active mask is chained from the detached hard decisions), pushing
+            # each sigmoid away from the 0.5 flip zone so the hard decision stops flipping and
+            # the STE stays valid. the forced fallback head is excluded, it makes no decision
+            if args.decision_entropy > 0:
+                sharp = 0.
+                active = torch.ones_like(p_hist[0])
+                for l in range(num_layers - 1):
+                    p = p_hist[l]
+                    bp = -(p * p.clamp_min(1e-6).log() + (1 - p) * (1 - p).clamp_min(1e-6).log())
+                    sharp = sharp + (bp * active).sum() / active.sum().clamp_min(1)
+                    active = active * (p.detach() <= 0.5).float()
+                loss = loss + args.decision_entropy * sharp
+                sharp_stat += sharp.item()
+            # C: load balancing. the soft stop-time distribution w (per sample sum_l w_l = 1,
+            # fully differentiable) is derived from p_hist; maximizing the batch marginal
+            # entropy keeps every layer's hard injection path in use so unselected paths do
+            # not rot. decayed to 0 so the selection may settle on a non-uniform distribution
+            # later. supersedes the plain mean-activation entropy term
+            if args.balance_reg > 0:
+                progress = epoch / max(args.epochs - 1, 1)
+                q = torch.ones_like(p_hist[0])
+                soft_w = []
+                for l in range(num_layers - 1):
+                    p = p_hist[l]
+                    soft_w.append(q * p)
+                    q = q * (1 - p)
+                soft_w.append(q)
+                w_mean = torch.stack(soft_w, dim=-1).mean(0)
+                marginal_entropy = -(w_mean * w_mean.clamp_min(1e-9).log()).sum()
+                loss = loss - args.balance_reg * (1 - progress) * marginal_entropy
+                marg_stat += marginal_entropy.item()
         losses += loss.item()
         _, pred = sim.max(-1)
         accs += labels.eq(pred).sum().float().item() / labels.shape[0]
@@ -338,6 +365,10 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
               f'| fallback: {select_freq[-1]:.3f}')
         for l in range(num_layers):
             args.logger.add_scalar(f'train/select_l{l}', select_freq[l].item(), epoch)
+        if args.decision_entropy > 0:
+            args.logger.add_scalar('train/decision_sharpness', sharp_stat / len(train_loader), epoch)
+        if args.balance_reg > 0:
+            args.logger.add_scalar('train/balance_entropy', marg_stat / len(train_loader), epoch)
 
 
 def test(text, student, decision_net, test_loader, epoch, args):
@@ -466,7 +497,8 @@ if __name__ == '__main__':
     parser.add_argument('--decision_warm_bias', type=float, default=2.)
     parser.add_argument('--decision_lr_mult', type=float, default=0.02)
     parser.add_argument('--decision_warmup_epochs', type=int, default=10)
-    parser.add_argument('--select_entropy_w', type=float, default=0.1)
+    parser.add_argument('--decision_entropy', type=float, default=0.01)
+    parser.add_argument('--balance_reg', type=float, default=0.01)
     parser.add_argument('--no_template', action='store_true')
     parser.add_argument('--eqnorm', action='store_true', default=True)
     parser.add_argument('--stage', type=float, default=3.2, choices=[2, 2.1, 2.2, 2.3, 3, 3.1, 3.2, 3.3])

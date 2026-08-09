@@ -6,7 +6,8 @@
 - 顺序决策：每层注入前 sigmoid(logit) > 0.5 即注入并终止；前三层都拒绝时第四层兜底强制注入，结构上保证每个样本恰好一层被注入
 - STE 直通：前向硬阈值、反向传 sigmoid 梯度，可微且训练/测试逻辑完全一致
 - 热启动：层 0/1 偏置 -2、层 2 偏置 +2，初始等价于固定注入 3.2 层
-- 删除 router、val 双层优化、gumbel tau、balance/entropy 正则及相关参数；启动标志 `--prompt_layer selective`
+- 删除 router、val 双层优化、gumbel tau 及相关参数；启动标志 `--prompt_layer selective`
+- 决策辅助损失（训练循环内由前向返回的 p_hist 推导，前向无需额外导出）：B 决策锐化（--decision_entropy）：对实际到达的决策点加二值熵惩罚，把 p 推离 0.5 不稳定区、抑制决策翻转；C 负载均衡（--balance_reg）：对批内软停时边际分布（Σw=1，可微）做熵最大化并随训练衰减，防坍缩到热启动层、保持未选中路径可训，替代原 select_entropy 项
 
 关键性质
 要求	实现
