@@ -48,6 +48,17 @@ class LayerSelectNet(nn.Module):
         return self.heads[layer](self.act(h)).view(-1)
 
 
+def make_prompt_res(dim, hidden=64):
+    """per-layer prompt residual: a small bottleneck whose last layer is zero-initialized, so
+    its output (added to the shared prompt) starts exactly at zero and training begins
+    identical to shared-prompt all-layer injection"""
+    m = nn.Sequential(nn.Linear(dim, hidden), nn.ReLU(inplace=True), nn.Linear(hidden, dim))
+    with torch.no_grad():
+        m[-1].weight.zero_()
+        m[-1].bias.zero_()
+    return m
+
+
 def main(args):
     # checkpoint and tensorboard dir
     args.tensorboard_dir = 'tensorboard/' + args.dataset + '/' + args.model + '/' + args.exp + '/'
@@ -163,16 +174,20 @@ def main(args):
                                                torch.nn.Linear(feature_dim, feature_dim),
                                                torch.nn.Sigmoid(),)
 
+    if args.prompt_layer == 'all':
+        # all-layer injection with per-layer prompt residuals, no decision net: each stage3
+        # layer injects the shared prompt plus its own learned residual
+        if 'spatial' in args.prompt_mode:
+            student.prompt_res1 = nn.ModuleList(
+                [make_prompt_res(feature_dim) for _ in range(len(student.stage3))])
+        if 'channel' in args.prompt_mode:
+            student.prompt_res2 = nn.ModuleList(
+                [make_prompt_res(feature_dim) for _ in range(len(student.stage3))])
+
     decision_net = None
-    if args.prompt_layer in ('selective', 'multi'):
+    if args.prompt_layer == 'selective':
         decision_net = LayerSelectNet(feature_dim, text_dim, len(student.stage3),
                                       warm_bias=args.decision_warm_bias)
-
-    # per-layer gate target for the multi-mode gate prior loss, clamped away from 0/1 so the
-    # log terms never saturate
-    args.gate_target = [min(max(float(v), 0.01), 0.99) for v in args.gate_target.split(',')]
-    if args.prompt_layer == 'multi' and len(args.gate_target) != len(student.stage3):
-        raise ValueError(f'--gate_target expects {len(student.stage3)} comma-separated values')
 
     student = student.cuda(args.gpu)
     if decision_net is not None:
@@ -182,6 +197,10 @@ def main(args):
     if 'channel' in args.prompt_mode:
         optim_params_id += [id(param) for param in student.t2i2.parameters()]  # se_block is not included. use smaller lr for se_block
         # optim_params_id += [id(param) for param in student.se_block.parameters()]
+    for attr in ('prompt_res1', 'prompt_res2'):
+        # the per-layer prompt residuals are newly added modules, train with the high lr
+        if hasattr(student, attr):
+            optim_params_id += [id(param) for param in getattr(student, attr).parameters()]
     optim_params = [param for param in student.parameters() if id(param) in optim_params_id]
     other_params = [param for param in student.parameters()
                     if id(param) not in optim_params_id]
@@ -288,9 +307,6 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
     accs = 0.
     num_layers = len(student.stage3)
     select_hist = torch.zeros(num_layers)
-    gate_sum = torch.zeros(num_layers)
-    prior_stat = 0.
-    gate_t = torch.tensor(args.gate_target, dtype=torch.float32).cuda(args.gpu)
     for idx, episode in enumerate(train_loader):
         image = episode[0].cuda(args.gpu)  # way * (shot+15)
         glabels = episode[1].cuda(args.gpu)
@@ -309,12 +325,8 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
             # a high share of the last layer means the fallback keeps firing, i.e. the first
             # three decision heads are all too conservative
             select_hist = select_hist + torch.bincount(selection, minlength=num_layers).float()
-        elif args.prompt_layer == 'multi':
-            _, sup_im_features, p_hist = student.forward_with_multi_prompt(sup, text_features, decision_net, args)
-            # per-layer mean gate: watch the soft injection strength drift from the warm start
-            # [~.12, ~.12, ~.88, ~.12]; all gates saturating to ~1 means multi collapsed into
-            # fixed full injection
-            gate_sum = gate_sum + p_hist.detach().cpu().mean(dim=1)
+        elif args.prompt_layer == 'all':
+            _, sup_im_features = student.forward_with_all_prompt(sup, text_features, args)
         elif args.prompt_mode == 'spatial':
             text_features = student.t2i(text_features)
             _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
@@ -327,21 +339,13 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
 
         sim = F.normalize(que_im_features, dim=-1) @ F.normalize(sup_im_features, dim=-1).t()
         loss = F.cross_entropy(sim / args.t, labels)
-        if args.prompt_layer in ('selective', 'multi'):
-            # batch-level load balancing: the classification signal alone rewards concentrating
-            # the injection onto one layer (or saturating the soft gates); maximizing the entropy
-            # of the mean per-layer activation keeps all layers in use
+        if args.prompt_layer == 'selective':
+            # batch-level load balancing: the STE classification signal alone rewards early
+            # injection and collapses the selection onto one layer; maximizing the entropy of
+            # the mean per-layer activation keeps all layers in use
             q = p_hist.mean(dim=1)
             entropy = -(q * (q + 1e-6).log()).sum()
             loss = loss - args.select_entropy_w * entropy
-            if args.prompt_layer == 'multi' and args.gate_prior_w > 0:
-                # gate prior: BCE with the user-specified per-layer target t as soft label pushes
-                # the batch-mean gate q_l toward t_l, making the injection-strength profile
-                # manually steerable (default t favors stage3_2). set --select_entropy_w 0 if
-                # the uniformizing entropy pressure is not wanted on top of it
-                prior = -(gate_t * (q + 1e-6).log() + (1 - gate_t) * (1 - q).clamp_min(1e-6).log()).sum()
-                loss = loss + args.gate_prior_w * prior
-                prior_stat += prior.item()
         losses += loss.item()
         _, pred = sim.max(-1)
         accs += labels.eq(pred).sum().float().item() / labels.shape[0]
@@ -361,13 +365,6 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
               f'| fallback: {select_freq[-1]:.3f}')
         for l in range(num_layers):
             args.logger.add_scalar(f'train/select_l{l}', select_freq[l].item(), epoch)
-    elif args.prompt_layer == 'multi':
-        gate_mean = gate_sum / len(train_loader)
-        print('gate mean:', [f'{g:.3f}' for g in gate_mean.tolist()])
-        for l in range(num_layers):
-            args.logger.add_scalar(f'train/gate_l{l}', gate_mean[l].item(), epoch)
-        if args.gate_prior_w > 0:
-            args.logger.add_scalar('train/gate_prior', prior_stat / len(train_loader), epoch)
 
 
 def test(text, student, decision_net, test_loader, epoch, args):
@@ -392,8 +389,8 @@ def test(text, student, decision_net, test_loader, epoch, args):
                 text_features = text[glabels]
                 if args.prompt_layer == 'selective':
                     _, sup_im_features, _, _ = student.forward_with_selective_prompt(sup, text_features, decision_net, args)
-                elif args.prompt_layer == 'multi':
-                    _, sup_im_features, _ = student.forward_with_multi_prompt(sup, text_features, decision_net, args)
+                elif args.prompt_layer == 'all':
+                    _, sup_im_features = student.forward_with_all_prompt(sup, text_features, args)
                 elif args.prompt_mode == 'spatial':
                     text_features = student.t2i(text_features)
                     _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
@@ -438,8 +435,8 @@ def test(text, student, decision_net, test_loader, epoch, args):
                 # _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
                 if args.prompt_layer == 'selective':
                     _, sup_im_features, _, _ = student.forward_with_selective_prompt(sup, text_features, decision_net, args)
-                elif args.prompt_layer == 'multi':
-                    _, sup_im_features, _ = student.forward_with_multi_prompt(sup, text_features, decision_net, args)
+                elif args.prompt_layer == 'all':
+                    _, sup_im_features = student.forward_with_all_prompt(sup, text_features, args)
                 elif args.prompt_mode == 'spatial':
                     text_features = student.t2i(text_features)
                     _, sup_im_features = student.forward_with_semantic_prompt(sup, text_features, args)
@@ -496,13 +493,11 @@ if __name__ == '__main__':
     parser.add_argument('--model', type=str, default='visformer-t', choices=['visformer-t', 'visformer-t-84'])
     parser.add_argument('--nlp_model', type=str, default='clip', choices=['clip', 'glove', 'mpnet'])
     parser.add_argument('--prompt_mode', type=str, default='spatial+channel', choices=['spatial', 'channel', 'spatial+channel'])
-    parser.add_argument('--prompt_layer', type=str, default='fixed', choices=['fixed', 'selective', 'multi'])
+    parser.add_argument('--prompt_layer', type=str, default='fixed', choices=['fixed', 'selective', 'all'])
     parser.add_argument('--decision_warm_bias', type=float, default=2.)
     parser.add_argument('--decision_lr_mult', type=float, default=0.02)
     parser.add_argument('--decision_warmup_epochs', type=int, default=10)
     parser.add_argument('--select_entropy_w', type=float, default=0.1)
-    parser.add_argument('--gate_prior_w', type=float, default=0.1)
-    parser.add_argument('--gate_target', type=str, default='0.1,0.1,0.8,0.1')
     parser.add_argument('--no_template', action='store_true')
     parser.add_argument('--eqnorm', action='store_true', default=True)
     parser.add_argument('--stage', type=float, default=3.2, choices=[2, 2.1, 2.2, 2.3, 3, 3.1, 3.2, 3.3])

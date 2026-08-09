@@ -7,9 +7,8 @@
 - STE 直通：前向硬阈值、反向传 sigmoid 梯度，可微且训练/测试逻辑完全一致
 - 热启动：层 0/1 偏置 -2、层 2 偏置 +2，初始等价于固定注入 3.2 层
 - 删除 router、val 双层优化、gumbel tau 及相关参数；启动标志 `--prompt_layer selective`
-- 决策辅助损失：批级均值激活熵（--select_entropy_w，selective 与 multi 共用）防选择/门控坍缩到单层
-- multi 模式（`--prompt_layer multi`）：四层软门控注入，w_l=sigmoid(logit_l)，四层皆注入、程度随样本自适应，完全可微（无 STE/兜底/恰好一层约束）；spatial 复用单预留行每层加性刷新，channel 广播加；四层共享 t2i/t2i2 投影；辅助损失仅沿用 select_entropy（作用于门控均值）；监控为每层 gate 均值（train/gate_l{l}）
-- 门控先验损失（multi，--gate_prior_w / --gate_target）：以目标向量为软标签对批级均值门控做 BCE，把各层注入强度推向人为设定值（默认 [0.1,0.1,0.8,0.1]，即 stage3_2 高注入）；启用时建议 --select_entropy_w 0 避免均匀化压力冲突
+- 决策辅助损失：批级均值激活熵（--select_entropy_w，仅 selective）防选择坍缩到单层
+- all 模式（`--prompt_layer all`）：四层全注入，无门控/无选择/无决策网络；每层注入“共享 prompt + 该层残差”，残差为每层瓶颈 MLP（384→64→384，末层零初始化，初始严格等于共享 prompt 注入），spatial 与 channel 均带残差；spatial 复用单预留行每层加性刷新，channel 广播加；残差参数归高学习率组
 
 关键性质
 要求	实现

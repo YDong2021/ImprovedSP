@@ -608,11 +608,11 @@ class Visformer(nn.Module):
         logit = self.head( x.view(x.size(0), -1) )
         return logit, x.squeeze(), selection, torch.stack(p_hist)
 
-    # multi-layer gated prompt injection: every stage3 block receives the shared prompt scaled
-    # by its own soft gate w_l = sigmoid(logit_l), so all four layers are injected with
-    # sample-dependent strength. no STE / fallback / exactly-one constraint is needed: the gates
-    # are continuous and the whole path is differentiable, train and test are trivially identical
-    def forward_with_multi_prompt(self, x, semantic_prompt, decision_net, args):
+    # all-layer prompt injection with per-layer residuals: every stage3 block receives the
+    # shared prompt plus its own learned bottleneck residual, so each layer's injected content
+    # differs while staying anchored to the shared semantic prompt. no gating / selection / 
+    # decision net: fully deterministic and differentiable, train and test are identical
+    def forward_with_all_prompt(self, x, semantic_prompt, args):
         if 'spatial' in args.prompt_mode:
             prompt1 = self.t2i(semantic_prompt)
         if 'channel' in args.prompt_mode:
@@ -649,21 +649,18 @@ class Visformer(nn.Module):
             # persistent prompt row, kept until pooling. the sequence stays (H+1) x W so the
             # H != W attention hack and the pooling logic work unchanged
             x = torch.cat([x, torch.zeros(B, C, 1, W, dtype=x.dtype, device=x.device)], dim=2)
-        g_hist = []
         for l, b in enumerate(self.stage3):
-            v = x[:, :, :H].reshape(B, C, -1).mean(-1)
-            w = torch.sigmoid(decision_net(v, semantic_prompt, l))
-            g_hist.append(w)
-            gate = w.view(B, 1, 1, 1)
             if 'channel' in args.prompt_mode:
+                p2 = prompt2 + self.prompt_res2[l](prompt2)
                 context = x[:, :, :H].reshape(B, C, -1).mean(-1)
-                context = torch.cat([context, prompt2], dim=-1)
+                context = torch.cat([context, p2], dim=-1)
                 context = self.se_block(context)
                 context = context - context.mean(dim=-1, keepdim=True)
-                x = torch.cat([x[:, :, :H] + gate * context.view(B, C, 1, 1), x[:, :, H:]], dim=2)
+                x = torch.cat([x[:, :, :H] + context.view(B, C, 1, 1), x[:, :, H:]], dim=2)
             if 'spatial' in args.prompt_mode:
-                # additive refresh of the same reserved row each layer
-                x = torch.cat([x[:, :, :H], x[:, :, H:] + gate * prompt1.view(B, C, 1, 1)], dim=2)
+                # additive refresh of the same reserved row with this layer's own prompt
+                p1 = prompt1 + self.prompt_res1[l](prompt1)
+                x = torch.cat([x[:, :, :H], x[:, :, H:] + p1.view(B, C, 1, 1)], dim=2)
             x = b(x)
 
         # head
@@ -683,7 +680,7 @@ class Visformer(nn.Module):
             x = x[:, :, 0, 0]
 
         logit = self.head( x.view(x.size(0), -1) )
-        return logit, x.squeeze(), torch.stack(g_hist)
+        return logit, x.squeeze()
 
 
 def visformer_tiny(**kwargs):
