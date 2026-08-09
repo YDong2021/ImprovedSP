@@ -168,6 +168,12 @@ def main(args):
         decision_net = LayerSelectNet(feature_dim, text_dim, len(student.stage3),
                                       warm_bias=args.decision_warm_bias)
 
+    # per-layer gate target for the multi-mode gate prior loss, clamped away from 0/1 so the
+    # log terms never saturate
+    args.gate_target = [min(max(float(v), 0.01), 0.99) for v in args.gate_target.split(',')]
+    if args.prompt_layer == 'multi' and len(args.gate_target) != len(student.stage3):
+        raise ValueError(f'--gate_target expects {len(student.stage3)} comma-separated values')
+
     student = student.cuda(args.gpu)
     if decision_net is not None:
         decision_net = decision_net.cuda(args.gpu)
@@ -283,6 +289,8 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
     num_layers = len(student.stage3)
     select_hist = torch.zeros(num_layers)
     gate_sum = torch.zeros(num_layers)
+    prior_stat = 0.
+    gate_t = torch.tensor(args.gate_target, dtype=torch.float32).cuda(args.gpu)
     for idx, episode in enumerate(train_loader):
         image = episode[0].cuda(args.gpu)  # way * (shot+15)
         glabels = episode[1].cuda(args.gpu)
@@ -326,6 +334,14 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
             q = p_hist.mean(dim=1)
             entropy = -(q * (q + 1e-6).log()).sum()
             loss = loss - args.select_entropy_w * entropy
+            if args.prompt_layer == 'multi' and args.gate_prior_w > 0:
+                # gate prior: BCE with the user-specified per-layer target t as soft label pushes
+                # the batch-mean gate q_l toward t_l, making the injection-strength profile
+                # manually steerable (default t favors stage3_2). set --select_entropy_w 0 if
+                # the uniformizing entropy pressure is not wanted on top of it
+                prior = -(gate_t * (q + 1e-6).log() + (1 - gate_t) * (1 - q).clamp_min(1e-6).log()).sum()
+                loss = loss + args.gate_prior_w * prior
+                prior_stat += prior.item()
         losses += loss.item()
         _, pred = sim.max(-1)
         accs += labels.eq(pred).sum().float().item() / labels.shape[0]
@@ -350,6 +366,8 @@ def train(text, student, decision_net, train_loader, optim, epoch, args):
         print('gate mean:', [f'{g:.3f}' for g in gate_mean.tolist()])
         for l in range(num_layers):
             args.logger.add_scalar(f'train/gate_l{l}', gate_mean[l].item(), epoch)
+        if args.gate_prior_w > 0:
+            args.logger.add_scalar('train/gate_prior', prior_stat / len(train_loader), epoch)
 
 
 def test(text, student, decision_net, test_loader, epoch, args):
@@ -483,6 +501,8 @@ if __name__ == '__main__':
     parser.add_argument('--decision_lr_mult', type=float, default=0.02)
     parser.add_argument('--decision_warmup_epochs', type=int, default=10)
     parser.add_argument('--select_entropy_w', type=float, default=0.1)
+    parser.add_argument('--gate_prior_w', type=float, default=0.1)
+    parser.add_argument('--gate_target', type=str, default='0.1,0.1,0.8,0.1')
     parser.add_argument('--no_template', action='store_true')
     parser.add_argument('--eqnorm', action='store_true', default=True)
     parser.add_argument('--stage', type=float, default=3.2, choices=[2, 2.1, 2.2, 2.3, 3, 3.1, 3.2, 3.3])

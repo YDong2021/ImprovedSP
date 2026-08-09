@@ -9,6 +9,7 @@
 - 删除 router、val 双层优化、gumbel tau 及相关参数；启动标志 `--prompt_layer selective`
 - 决策辅助损失：批级均值激活熵（--select_entropy_w，selective 与 multi 共用）防选择/门控坍缩到单层
 - multi 模式（`--prompt_layer multi`）：四层软门控注入，w_l=sigmoid(logit_l)，四层皆注入、程度随样本自适应，完全可微（无 STE/兜底/恰好一层约束）；spatial 复用单预留行每层加性刷新，channel 广播加；四层共享 t2i/t2i2 投影；辅助损失仅沿用 select_entropy（作用于门控均值）；监控为每层 gate 均值（train/gate_l{l}）
+- 门控先验损失（multi，--gate_prior_w / --gate_target）：以目标向量为软标签对批级均值门控做 BCE，把各层注入强度推向人为设定值（默认 [0.1,0.1,0.8,0.1]，即 stage3_2 高注入）；启用时建议 --select_entropy_w 0 避免均匀化压力冲突
 
 关键性质
 要求	实现
