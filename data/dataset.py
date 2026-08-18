@@ -101,11 +101,10 @@ class DatasetWithTextLabel(object):
 
     def __getitem__(self, i):
         image, label = self.dataset[i]
-        text = self.dataset.classes[label]
-        text = self.idx2text[text]
-        # text prompt: A photo of a {label}
-        text = 'A photo of a ' + text
-        return image, label, text
+        # the third return value is the global sample index (aligned with the ImageFolder
+        # ordering). use_caption mode in train_vit_sp.py uses it to look up per-image
+        # LLaVA caption features in data/captions/{dataset}_{split}_clip_features.pt
+        return image, label, i
 
     def __len__(self):
         return len(self.dataset)

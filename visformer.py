@@ -429,9 +429,13 @@ class Visformer(nn.Module):
         logit = self.head( x.view(x.size(0), -1) )
         return logit, x.squeeze()
 
-    def forward_with_semantic_prompt_channel(self, x, semantic_prompt, args):
+    # prompt1: pre-projected spatial prompt (t2i output). pass it when the caller already
+    # computed t2i(text) (e.g. to reuse it in the InfoNCE alignment loss), otherwise it is
+    # computed here
+    def forward_with_semantic_prompt_channel(self, x, semantic_prompt, args, prompt1=None):
         if 'spatial' in args.prompt_mode:
-            prompt1 = self.t2i(semantic_prompt)
+            if prompt1 is None:
+                prompt1 = self.t2i(semantic_prompt)
         if 'channel' in args.prompt_mode:
             prompt2 = self.t2i2(semantic_prompt)
 
@@ -510,6 +514,106 @@ class Visformer(nn.Module):
 
         logit = self.head( x.view(x.size(0), -1) )
         return logit, x.squeeze()
+
+    # selective prompt injection: before each stage3 block, a lightweight decision head scores
+    # the current visual features together with the text prompt. the first layer whose sigmoid
+    # passes the 0.5 threshold gets the injection and all later layers are skipped, so exactly one
+    # layer is injected per sample. layer 3 is a forced fallback. the STE relaxation
+    # (hard forward, sigmoid gradient backward) keeps the decision differentiable while train and
+    # test run the exact same hard logic.
+    # prompt1: pre-projected spatial prompt (t2i output), same convention as
+    # forward_with_semantic_prompt_channel
+    def forward_with_selective_prompt(self, x, semantic_prompt, decision_net, args, prompt1=None):
+        if 'spatial' in args.prompt_mode:
+            if prompt1 is None:
+                prompt1 = self.t2i(semantic_prompt)
+        if 'channel' in args.prompt_mode:
+            prompt2 = self.t2i2(semantic_prompt)
+
+        if self.using_stem:
+            x = self.stem(x)
+
+        # stage 1
+        x = self.patch_embed1(x)
+        if self.pos_embed:
+            x = x + self.pos_embed1
+            x = self.pos_drop(x)
+        for b in self.stage1:
+            x = b(x)
+
+        # stage 2 (no injection)
+        if not self.vit_embedding:
+            x = self.patch_embed2(x)
+            if self.pos_embed:
+                x = x + self.pos_embed2
+                x = self.pos_drop(x)
+        for b in self.stage2:
+            x = b(x)
+
+        # stage3
+        if not self.vit_embedding:
+            x = self.patch_embed3(x)
+            if self.pos_embed:
+                x = x + self.pos_embed3
+                x = self.pos_drop(x)
+        B, C, H, W = x.shape
+        num_layers = len(self.stage3)
+        if 'spatial' in args.prompt_mode:
+            # persistent prompt row, kept until pooling. the sequence stays (H+1) x W so the
+            # H != W attention hack and the pooling logic work unchanged
+            x = torch.cat([x, torch.zeros(B, C, 1, W, dtype=x.dtype, device=x.device)], dim=2)
+        injected = torch.zeros(B, dtype=torch.bool)
+        selection = torch.full((B,), num_layers - 1, dtype=torch.long)
+        p_hist = []
+        for l, b in enumerate(self.stage3):
+            active = (~injected).to(x.device)
+            # logits are computed for every sample at every layer (not only the still-active
+            # ones) so the batch-level entropy regularizer gets a signal for all heads
+            v = x[:, :, :H].reshape(B, C, -1).mean(-1)
+            logit = decision_net(v, semantic_prompt, l)
+            p = torch.sigmoid(logit)
+            p_hist.append(p)
+            if active.any():
+                if l < num_layers - 1:
+                    d = (p > 0.5).float()
+                    # STE: forward value is the hard decision, backward gradient is sigmoid'(logit)
+                    gate = d + p - p.detach()
+                else:
+                    # fallback layer: injection is forced, the head is kept for monitoring only
+                    gate = torch.ones_like(p)
+                mask = (gate * active).view(B, 1, 1, 1)
+                if 'channel' in args.prompt_mode:
+                    context = x[:, :, :H].reshape(B, C, -1).mean(-1)
+                    context = torch.cat([context, prompt2], dim=-1)
+                    context = self.se_block(context)
+                    context = context - context.mean(dim=-1, keepdim=True)
+                    x = torch.cat([x[:, :, :H] + mask * context.view(B, C, 1, 1), x[:, :, H:]], dim=2)
+                if 'spatial' in args.prompt_mode:
+                    x = torch.cat([x[:, :, :H], x[:, :, H:] + mask * prompt1.view(B, C, 1, 1)], dim=2)
+                d_hard = (p > 0.5).view(-1).cpu() if l < num_layers - 1 else torch.ones(B, dtype=torch.bool)
+                newly = active.cpu() & d_hard
+                selection[newly] = l
+                injected = injected | newly
+            x = b(x)
+
+        # head
+        x = self.norm(x)
+        if self.pool:
+            if 'spatial' not in args.prompt_mode:
+                x = self.global_pooling(x)
+            else:
+                B, C, H, W = x.shape
+                if args.avg == 'all':
+                    x = x.view(B, C, -1)[:, :, :(H - 1) * W + 1].mean(-1)
+                elif args.avg == 'patch':
+                    x = x.view(B, C, -1)[:, :, :(H - 1) * W].mean(-1)
+                elif args.avg == 'head':
+                    x = x.view(B, C, -1)[:, :, -1]
+        else:
+            x = x[:, :, 0, 0]
+
+        logit = self.head( x.view(x.size(0), -1) )
+        return logit, x.squeeze(), selection, torch.stack(p_hist)
 
 
 def visformer_tiny(**kwargs):
